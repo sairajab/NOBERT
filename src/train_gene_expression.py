@@ -11,7 +11,7 @@ from scipy.stats import pearsonr
 import json
 import os
 import wandb
-from train_mlm import GenomicTransformerV2 as ChromBERT  # adjust import to your actual class
+from models import ChromBERTModel as ChromBERT 
 from matplotlib import pyplot as plt
 
 """

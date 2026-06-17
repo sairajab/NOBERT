@@ -5,6 +5,7 @@ train_svm_rf.py
 """
 
 
+from asyncio import run
 import os
 import sys
 import time
@@ -454,7 +455,7 @@ def main():
  
     os.makedirs(args.output_dir, exist_ok=True)
  
-    # ── 1. Load dataset ──────────────────────────────────────────────
+    #  1. Load dataset 
     print("=" * 70)
     print("  LO" \
     "ADING DATASET")
@@ -467,7 +468,7 @@ def main():
         split_file=args.split_file,
     )
  
-    # ── 2. Extract sklearn arrays ────────────────────────────────────
+    #  2. Extract sklearn arrays 
     print("\n" + "=" * 70)
     print(f"  EXTRACTING FEATURES (aggregation={args.aggregation})")
     print("=" * 70)
@@ -531,113 +532,139 @@ def main():
             refit=True,
         )
     print("SKIPPING SVM GRID SEARCH (using default hyperparameters)...")
-    # svm_grid.fit(X_train_sc, y_train)
- 
-    # print(f"  Grid search done in {time.time()-t0:.1f}s")
-    # print(f"  Best params: {svm_grid.best_params_}")
-    # print(f"  Best CV F1:  {svm_grid.best_score_:.4f}")
- 
-    # svm_model = svm_grid.best_estimator_
-    # svm_best_params = svm_grid.best_params_
 
-    # svm_val_metrics, svm_val_pred, svm_val_prob = evaluate(svm_model, X_val_sc, y_val, "val")
-    # svm_test_metrics, svm_test_pred, svm_test_prob = evaluate(svm_model, X_test_sc, y_test, "test")
-    # all_metrics["SVM_val"] = svm_val_metrics
-    # all_metrics["SVM_test"] = svm_test_metrics
-    # all_metrics["SVM_params"] = svm_best_params
- 
-    # svm_path = os.path.join(args.output_dir, "svm_model.joblib")
-    # joblib.dump({"model": svm_model, "scaler": scaler, "params": svm_best_params}, svm_path)
-    # print(f"  Saved SVM model to {svm_path}")
+    if not args.skip_svm_grid:
+        svm_grid.fit(X_train, y_train)
+    
+        print(f"  Grid search done in {time.time()-t0:.1f}s")
+        print(f"  Best params: {svm_grid.best_params_}")
+        print(f"  Best CV F1:  {svm_grid.best_score_:.4f}")
+    
+        svm_model = svm_grid.best_estimator_
+        svm_best_params = svm_grid.best_params_
+
+        svm_val_metrics, svm_val_pred, svm_val_prob = evaluate(svm_model, X_val, y_val, "val")
 
     
+        svm_path = os.path.join(args.output_dir, "svm_model.joblib")
+        joblib.dump({"model": svm_model, "scaler": scaler, "params": svm_best_params}, svm_path)
+        print(f"  Saved SVM model to {svm_path}")
 
-    # run hgb 
+    else:
+        print("SKIPPING SVM GRID SEARCH (using default hyperparameters)...")
+    #     svm_model = SVC(probability=True, class_weight="balanced", random_state=42)
+    #     full_train_data = np.vstack([X_train_sc, X_val_sc])
+    #     full_train_labels = np.hstack([y_train, y_val])
+    #     svm_model.fit(full_train_data, full_train_labels)
+    #     svm_best_params = {"kernel": "rbf", "C": 1, "gamma": "scale"}
 
 
-    # model = GradientBoostingClassifier(n_estimators=500, max_depth=20)
-    # model.fit(X_train, y_train)
+    svm_test_metrics, svm_test_pred, svm_test_prob = evaluate(svm_model, X_test, y_test, "test")
+    all_metrics["SVM_test"] = svm_test_metrics
+    all_metrics["SVM_params"] = svm_best_params
 
-    # # evaluate hgb
-    # # y_val_pred = model.predict(X_val)
-    # # y_test_pred = model.predict(X_test)
 
-    # metrics, y_pred, y_prob = evaluate(model, X_test, y_test, split_name="test")
-    # print(metrics)
-
-    print("\n" + "=" * 70)
-    print("  TRAINING XGBOOST FOREST")
-    print("=" * 70)
- 
     neg, pos = np.bincount(y_train)
     scale_pos_weight = neg / pos
+    if not args.skip_gb_grid:
+        print("\n" + "=" * 70)
+        print("  TRAINING XGBOOST FOREST")
+        print("=" * 70)
+    
 
-    xgb_param_grid = {
-        "max_depth":        [4, 6, 8],
-        "learning_rate":    [0.05, 0.1, 0.2],
-        "min_child_weight": [1, 5, 10],
+
+        xgb_param_grid = {
+            "max_depth":        [4, 6, 8],
+            "learning_rate":    [0.05, 0.1, 0.2],
+            "min_child_weight": [1, 5, 10],
+            
+            #  multiplies grid size:
+            # "subsample":        [0.8, 1.0],
+            # "colsample_bytree": [0.8, 1.0],
+        }
+        print(f"  Grid search: {xgb_param_grid}")
+        t0 = time.time()
+
+        xgb_estimator = XGBClassifier(
+            objective='binary:logistic',
+            tree_method='hist',
+            eval_metric='aucpr',            
+            scale_pos_weight=scale_pos_weight,
+            n_jobs=1,                        
+            random_state=42,
+            verbosity=0,
+            early_stopping_rounds=None,           
+            n_estimators=2000,                  
+
+        )
+
+        xgb_grid = GridSearchCV(
+            xgb_estimator,
+            xgb_param_grid,
+            cv=cv,
+            scoring='f1',
+            n_jobs=args.n_jobs,
+            verbose=1,
+            refit=True,
+        )
+        xgb_grid.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=True,
+    )
+    
+        print(f"  Grid search done in {time.time()-t0:.1f}s")
+        print(f"  Best params: {xgb_grid.best_params_}")
+        print(f"  Best CV F1:  {xgb_grid.best_score_:.4f}")
+    
+        #Best params: {'learning_rate': 0.05, 'max_depth': 8, 'min_child_weight': 5}                                                                                                                 
+
+        xgb_model = xgb_grid.best_estimator_
+        xgb_best_params = xgb_grid.best_params_
+    
+    else:
+        print("SKIPPING XGBOOST GRID SEARCH (using best params from earlier run)...")
+        best ={'learning_rate': 0.05, 'max_depth': 8, 'min_child_weight': 5, 'n_estimators': 979, 'colsample_bytree': 1.0, 'subsample': 0.8} 
+        xgb_model = XGBClassifier(
+            objective="binary:logistic",
+            tree_method="exact",
+            eval_metric="aucpr",
+            scale_pos_weight=neg / pos,
+            reg_lambda=1,
+            random_state=42,
+            verbosity=0,
+            n_jobs=-1,
+            early_stopping_rounds=None,     # ON now, so it actually picks the tree count
+            **best,
+        )
+        total_train_data = np.vstack([X_train, X_val])
+        total_train_labels = np.hstack([y_train, y_val])
+        xgb_model.fit(
+            total_train_data, total_train_labels,
+            eval_set=[(X_val, y_val)],
+            verbose=50,
+        )
         
-        #  multiplies grid size:
-        # "subsample":        [0.8, 1.0],
-        # "colsample_bytree": [0.8, 1.0],
-    }
-    print(f"  Grid search: {xgb_param_grid}")
-    t0 = time.time()
+    print("\n" + "=" * 70)
+    #print(xgb_model.best_iteration)
 
-    xgb_estimator = XGBClassifier(
-        objective='binary:logistic',
-        tree_method='hist',
-        eval_metric='aucpr',            
-        scale_pos_weight=scale_pos_weight,
-        n_jobs=1,                        
-        random_state=42,
-        verbosity=0,
-        early_stopping_rounds=30,           
-        n_estimators=2000,                  # generous ceiling, early stopping picks the real number
-
-    )
-
-    xgb_grid = GridSearchCV(
-        xgb_estimator,
-        xgb_param_grid,
-        cv=cv,
-        scoring='f1',
-        n_jobs=args.n_jobs,
-        verbose=1,
-        refit=True,
-    )
-    xgb_grid.fit(
-    X_train, y_train,
-    eval_set=[(X_val, y_val)],
-    verbose=True,
-)
- 
-    print(f"  Grid search done in {time.time()-t0:.1f}s")
-    print(f"  Best params: {xgb_grid.best_params_}")
-    print(f"  Best CV F1:  {xgb_grid.best_score_:.4f}")
- 
-    #Best params: {'learning_rate': 0.05, 'max_depth': 8, 'min_child_weight': 5}                                                                                                                 
-
-    xgb_model = xgb_grid.best_estimator_
-    xgb_best_params = xgb_grid.best_params_
-     
     # Evaluate RF
-    xgb_val_metrics, xgb_val_pred, xgb_val_prob = evaluate(xgb_model, X_val, y_val, "val")
+    #xgb_val_metrics, xgb_val_pred, xgb_val_prob = evaluate(xgb_model, X_val, y_val, "val")
     xgb_test_metrics, xgb_test_pred, xgb_test_prob = evaluate(xgb_model, X_test, y_test, "test")
-    all_metrics["XGB_val"] = xgb_val_metrics
+    #all_metrics["XGB_val"] = xgb_val_metrics
     all_metrics["XGB_test"] = xgb_test_metrics
     all_metrics["XGB_params"] = xgb_best_params
 
     print(all_metrics)
  
-    xgb_path = os.path.join(args.output_dir, "xgb_model.joblib")
+    xgb_path = os.path.join(args.output_dir, "xgb_model_l2.joblib")
     joblib.dump({"model": xgb_model, "scaler": scaler, "params": xgb_best_params}, xgb_path)
     print(f"  Saved XGB model to {xgb_path}")
  
     # Feature importance plot
     plot_feature_importance(
         xgb_model.feature_importances_, feature_names,
-        args.output_dir, model_name="XGB", top_k=min(30, X_train_sc.shape[1]),
+        args.output_dir, model_name="XGB_l2", top_k=min(30, X_train_sc.shape[1]),
     )
  
     if svm_best_params.get("kernel") == "linear":
