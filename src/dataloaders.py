@@ -31,7 +31,7 @@ class ChromBERTDataset(Dataset):
         self.current_mask_idx = 0  # for "precomputed" mode epoch cycling
 
         # Load cluster info
-        self.cluster_df = pd.read_csv("../DATA/pretraining/experiment_clusters_pearson.tsv", sep="\t")
+        self.cluster_df = pd.read_csv("/s/chromatin/c/nobackup/Saira/BERTModel/DATA/pretraining/experiment_clusters_pearson.tsv", sep="\t")
         self.experiment_to_cluster = dict(
             zip(self.cluster_df["experiment"], self.cluster_df["cluster"])
         )
@@ -188,6 +188,41 @@ class ChromBERTDataset(Dataset):
             seq = torch.from_numpy(self.data[idx]).long()
             target = torch.from_numpy(self.data[idx]).long()
             return seq, target
+    
+    def create_splits_from_data(self, split_file = "/s/chromatin/a/nobackup/Saira/SPLICE_SITE_PREDICTION/src/enhancers_split.csv"):
+
+        split_df = pd.read_csv(split_file)
+        seq_to_split = {}
+        for _, row in split_df.iterrows():
+            chrom = row['chrom'] #chrom,start,end,name,score,strand,split
+
+            start = row['start']
+            end = row['end']
+
+            seq_id = (chrom, start, end)
+            seq_to_split[seq_id] = row['split']
+        missed_introns = set()
+        splits = {"train": [], "val": [], "test": []}
+        for idx in range(len(self.ids)):
+
+            id = self.ids[idx]
+            chrom = id.split(":")[0]
+            start = int(id.split(":")[1].split("-")[0])
+            end = int(id.split(":")[1].split("-")[1])
+            seq_key = (chrom, start, end)
+            
+            split = seq_to_split.get(seq_key, "train")  # Default to 'train' if not found
+            if split in splits:
+                splits[split].append(idx)
+            else:
+                missed_introns.add(seq_key)
+
+        if missed_introns:
+            print(f"Warning: The following sequences were not found in the split mapping and were assigned to 'train': {len(missed_introns)}")
+
+
+        return splits
+    
 
 
 class ChromBERTDatasetOnFly(Dataset):
@@ -239,13 +274,17 @@ class ChromBERTDatasetOnFly(Dataset):
 class EnhancersDatasetFast(Dataset):
  
     def __init__(self, track_matrix_path, labels_file_path, n_windows=3, stride=200, window_size=200, pick_closest_bin=False,pretrain_datapath=None,
-                 split_file="/s/chromatin/a/nobackup/Saira/SPLICE_SITE_PREDICTION/src/enhancers_split.csv"):
+                 split_file="/s/chromatin/a/nobackup/Saira/SPLICE_SITE_PREDICTION/src/enhancers_split.csv", filter_by=None):
  
         self.split_file = split_file
         self.window_size = window_size
         self.stride = stride
         self.num_labels = 2
         self.n_windows = n_windows
+        self.filter_by = filter_by
+        if self.filter_by is not None:
+            filter_columns =  np.load(self.filter_by)[0]
+            print("loaded mask for filtering features ", filter_columns.sum(), filter_columns.shape)
  
         # ── Load labels ──
         if self.split_file is not None:
@@ -282,14 +321,21 @@ class EnhancersDatasetFast(Dataset):
                 "Track matrix must have an 'actual' column. "
                 "Found columns: " + str(track_df.columns[:5].tolist())
             )
+
+
  
         actual_col = track_df['actual'].values
         window_index = track_df.index.values  # window coordinates
         feature_cols = [c for c in track_df.columns if c != 'actual']
         self.n_features = len(feature_cols)
-        self.feature_values = track_df[feature_cols].values.astype(np.float32)
- 
         print(f"  Features: {self.n_features}")
+        if self.filter_by is not None:
+            feature_cols = [col for col, keep in zip(feature_cols, filter_columns) if keep==1]
+            self.n_features = len(feature_cols)
+        print(f"  Filtered features: {self.n_features}")
+        self.feature_values = track_df[feature_cols].values.astype(np.float32)
+       
+         
         print(f"  Sample: window={window_index[0]} -> actual={actual_col[0]}")
  
         # ── Build lookup: actual_key -> sorted list of (window_start, row_idx) ──
@@ -417,7 +463,14 @@ class EnhancersDatasetFast(Dataset):
             print(f"Warning: No windows for {name} at idx {idx}")
             windows = [self._zero]
  
+        # pick max of windows if more than one
+
+
         data = torch.from_numpy(np.stack(windows))
+        #### temporary fix: take max across windows to reduce to single feature vector
+        data = torch.max(data, dim=0)[0]  # take max across windows
+        # add a dimension to make it (1, n_features) for consistency
+        data = data.unsqueeze(0)  # shape: (1, n_features)
         label = torch.tensor(label, dtype=torch.long)
  
         return name, data, label
