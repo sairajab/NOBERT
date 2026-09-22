@@ -48,26 +48,29 @@ thresholds_500bpsIR = {
     "DNA methylation": 0.9, # 0.9
 }
 # ================= CONFIGURATION =================
-# Paths to your input folders
+# Paths to your input 
+DATA_DIR = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/"
 BW_FOLDER = "/s/chromatin/c/nobackup/deepplant/Data/Arabidopsis_thaliana/Bigwig/"       
 BED_FOLDER = "/s/chromatin/b/nobackup/deepplant/Data/arabidopsis_thaliana/Chiphub_bedfile/"  
-BINS_FILE =  "athal_500bp_bins.bed"
-BINS_FILE = "enhancers_2500.bed"
-BINS_FILE = "../idiffir_py3x/ir200_introns.bed"
-BINS_FILE = "enhancers_600.bed"
-BINS_FILE = "../idiffir_py3x/introns_5p3p_150_tested.bed"
-BINS_FILE = "gene_TSS_600_3w.bed"
+BINS_FILE =  "../../DATA/pretraining/athal_500bp_bins.bed"
+BINS_FILE = "../../DATA/enhancers/enhancers_2500.bed"
+# BINS_FILE = "enhancers_2500.bed"
+# BINS_FILE = "../idiffir_py3x/ir200_introns.bed"
+# BINS_FILE = "enhancers_600.bed"
+# BINS_FILE = "../idiffir_py3x/introns_5p3p_150_tested.bed"
+#BINS_FILE = os.path.join(DATA_DIR,"gene expression" ,"gene_TSS_500_1w.bed")
 
-BINS_FILE = "../enhancers_600_full.bed"
-BINS_FILE = "../DATA/phenotype/600_clutivar_932.bed"
+# BINS_FILE = "../enhancers_600_full.bed"
+# BINS_FILE = "../DATA/phenotype/600_clutivar_932.bed"
 #"/s/chromatin/a/nobackup/Saira/SATORI_ENHANCEMENTS/satoriv2/enhancers_500.bed" # enhancers file for 500bp bins
 #"/s/chromatin/a/nobackup/Saira/SATORI_ENHANCEMENTS/satoriv2/enhancers_50.bed"
 #"../idiffir_py3x/introns_5p3p_200bp_tested.bed" # "athal_200bp_bins.bed" # The master 200bp bins file created earlier
-METADATA_PATH = '/s/chromatin/c/nobackup/Saira/BERTModel/merged_metadata_AT_OCR.csv'
+METADATA_PATH = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/AT_CSP_Metadata 1.csv"
+#'/s/chromatin/c/nobackup/Saira/BERTModel/merged_metadata_AT_OCR.csv' filtered metadata file replaced with what ahmed shared with me
 # Output filenames
-OUT_CONT_MATRIX = "../DATA/phenotype/600_clutivar_932.parquet"
-OUT_DISC_MATRIX = "../DATA/phenotype/600_clutivar_932_disc.parquet"
-bin_size = 600
+OUT_CONT_MATRIX = os.path.join(DATA_DIR,"pretraining" ,"enhancers_2500_new_MT.parquet")
+OUT_DISC_MATRIX = os.path.join(DATA_DIR,"pretraining" ,"enhancers_2500_new_MT_discretized.parquet")
+bin_size = 500
 overlap_threshold = 100 / bin_size  # 0.2 for 500bp bins, 0.5 for 200bp bins
 
 
@@ -88,8 +91,8 @@ def load_master_bins(bins_file):
     """
     Loads the master BED file to define the index for our matrix.
     """
-    #df = pd.read_csv(bins_file, sep='\t', header=None, names=['chrom', 'start', 'end', 'name']) #, 'score', 'strand'])
-    df = pd.read_csv(bins_file, sep='\t')
+    df = pd.read_csv(bins_file, sep='\t', header=None, names=['chrom', 'start', 'end', 'name']) #, 'score', 'strand'])
+    #df = pd.read_csv(bins_file, sep='\t')
 
     # remove any rows with start < 0 
     df = df[df['start'] >= 0].copy()
@@ -157,21 +160,95 @@ def process_experiment(args):
         
     return experiment_name, signals, discrete_labels
 
+### chrombert embeddings
+
+def process_experiment_chrombert(args):
+    """
+    Worker function to process a single experiment (1 BW + 1 BED).
+
+    Discretizes the cistrome's genome-wide signal into 5 levels following the
+    ChromBERT scheme: binding vs. non-binding is decided by a single
+    genome-wide threshold (the 10th percentile of signal among peak-overlapping
+    bins), then each side is split into equal-sized portions by signal rank --
+    binding into 3 (slightly/moderately/strongly positive, labels 3/4/5),
+    non-binding into 2 (strongly/slightly negative, labels 1/2). Using the
+    10th percentile (rather than requiring a called peak) also recovers bins
+    whose true signal clears the bar but whose peak call was missed, and
+    demotes weak/noisy peak calls that fall below it.
+    """
+    bw_path, bed_path, bin_df, bin_size, factor_type = args
+    experiment_name = os.path.basename(bw_path).replace('.bw', '')
+
+    bw = pyBigWig.open(bw_path)
+    signals = []
+
+    for _, row in bin_df.iterrows():
+        try:
+            val = bw.stats(row['chrom'], row['start'], row['end'], type="mean")[0]
+            signals.append(val if val is not None else 0.0)
+        except RuntimeError:
+            signals.append(0.0)
+    bw.close()
+
+    signals = np.array(signals, dtype=np.float32)
+
+    bins_bt = BedTool.from_dataframe(bin_df[['chrom', 'start', 'end']])
+    peaks_bt = BedTool(bed_path)
+
+    intersect = bins_bt.intersect(peaks_bt, c=True) # any overlap
+
+    # 1. Identify all bins with peak overlap
+    overlap_mask = np.array([int(feat[-1]) > 0 for feat in intersect])
+
+    # 2. Binding/non-binding threshold: 10th percentile of signal among
+    #    peak-overlapping bins, applied genome-wide (not just to peak bins).
+    peak_signals = signals[overlap_mask]
+    if len(peak_signals) == 0:
+        binding_threshold = np.inf  # no peaks at all -> everything non-binding
+    else:
+        binding_threshold = np.percentile(peak_signals, 10)
+
+    binding_mask = signals >= binding_threshold
+
+    # 3. Default to label 1 (strongly negative) in case either group ends up empty.
+    discrete_labels = np.ones(len(signals), dtype=np.int8)
+
+    # 4. Binding group -> 3 equal-sized portions by signal rank.
+    binding_idx = np.flatnonzero(binding_mask)
+    if len(binding_idx) > 0:
+        ranked_idx = binding_idx[np.argsort(signals[binding_idx])]
+        slightly_pos, moderately_pos, strongly_pos = np.array_split(ranked_idx, 3)
+        discrete_labels[slightly_pos] = 3
+        discrete_labels[moderately_pos] = 4
+        discrete_labels[strongly_pos] = 5
+
+    # 5. Non-binding group -> 2 equal-sized portions by signal rank.
+    nonbinding_idx = np.flatnonzero(~binding_mask)
+    if len(nonbinding_idx) > 0:
+        ranked_idx = nonbinding_idx[np.argsort(signals[nonbinding_idx])]
+        strongly_neg, slightly_neg = np.array_split(ranked_idx, 2)
+        discrete_labels[strongly_neg] = 1
+        discrete_labels[slightly_neg] = 2
+
+    return experiment_name, signals, discrete_labels
+
 # ================= MAIN EXECUTION =================
 
 if __name__ == "__main__":
-    print("Loading master bins and metadata...")
-    phenotype_dir = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/phenotype/"
-    all_beds = glob.glob(os.path.join(phenotype_dir, "*.bed"))
+    # print("Loading master bins and metadata...")
+    # phenotype_dir = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/phenotype/"
+    # all_beds = glob.glob(os.path.join(phenotype_dir, "*.bed"))
 
-    for bed_ph in all_beds:
-        if bed_ph.endswith("600_clutivar_430.bed") or bed_ph.endswith("600_clutivar_932.bed"):
-            continue
-        bed_file_name_ph = os.path.basename(bed_ph).split(".bed")[0]
+    # for bed_ph in all_beds:
+    #     if bed_ph.endswith("600_clutivar_430.bed") or bed_ph.endswith("600_clutivar_932.bed"):
+    #         continue
+    #     bed_file_name_ph = os.path.basename(bed_ph).split(".bed")[0]
 
 
-        print(f"Found BED file: {bed_ph}")
-        master_bins = load_master_bins(bed_ph)
+    #     print(f"Found BED file: {bed_ph}")
+    #     master_bins = load_master_bins(bed_ph)
+
+        master_bins = load_master_bins(BINS_FILE)
 
         df = pd.read_csv(METADATA_PATH)
         #df = meta.parse(sheet_name=meta.sheet_names[0])
@@ -179,9 +256,10 @@ if __name__ == "__main__":
         missing_files_count = 0
         print("Constructing file paths...")
         missing_files = []
+        print(df.head())
         for _, row in df.iterrows():
             proj = str(row['BioProject ID'])
-            samp = str(row['Sample accession'])
+            samp = str(row['Sample accession number'])
             bed_name = str(row['Experiment Name']) + ".target.all.bed"
             factor_type = str(row['Factor_type'])
             
@@ -215,7 +293,7 @@ if __name__ == "__main__":
         disc_data = {}
         
         with Pool(NUM_CORES) as pool:
-            results = list(tqdm(pool.imap(process_experiment, tasks), total=len(tasks)))
+            results = list(tqdm(pool.imap(process_experiment_chrombert, tasks), total=len(tasks)))
         
         print("Assembling DataFrames...")
         for name, sig_arr, disc_arr in results:
@@ -225,8 +303,8 @@ if __name__ == "__main__":
             
         df_cont = pd.DataFrame(cont_data, index=master_bins['index_id'])
         df_disc = pd.DataFrame(disc_data, index=master_bins['index_id'])
-        OUT_CONT_MATRIX = f"{phenotype_dir}/{bed_file_name_ph}.parquet"
-        OUT_DISC_MATRIX = f"{phenotype_dir}/{bed_file_name_ph}_disc.parquet"
+        # OUT_CONT_MATRIX = f"{phenotype_dir}/{bed_file_name_ph}.parquet"
+        # OUT_DISC_MATRIX = f"{phenotype_dir}/{bed_file_name_ph}_disc.parquet"
         print("Saving results..." , OUT_CONT_MATRIX, OUT_DISC_MATRIX)
         df_cont.to_parquet(OUT_CONT_MATRIX)
         df_disc.to_parquet(OUT_DISC_MATRIX)

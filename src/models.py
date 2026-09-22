@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pandas as pd
 from torch.utils.checkpoint import checkpoint
+import numpy as np
 
 VOCAB_SIZE = 6  # 0: PAD, 1-4: Labels, 5: MASK
 EMBED_DIM = 768
@@ -285,7 +286,7 @@ class MultiWindowHeaderFusion(nn.Module):
 
     def __init__(self, chrombert_model, num_labels,
                  mtx_mask="/s/chromatin/c/nobackup/Saira/BERTModel/mtx_mask.txt",
-                 n_windows=3, dropout=0.1, medium_dim=256):
+                 n_windows=3, dropout=0.1, medium_dim=256, filter_by = None):
         super().__init__()
         self.chrombert = chrombert_model
         self.windows = n_windows
@@ -293,9 +294,16 @@ class MultiWindowHeaderFusion(nn.Module):
 
         if self.windows != 1:
             self.pos_embedding = SinusoidalPositionalEncoding(hidden_dim=768, num_slots=n_windows)
+        
+        self.filter_by = filter_by
+        if filter_by is None:
+            self.interface = CistromeEmbeddingManager(mtx_mask=mtx_mask)
+            n_factors = self.interface.normalized_mtx_mask.shape[1]
+        else:
+            filter_columns = np.load(filter_by)[0].astype(bool)
+            n_factors = int(filter_columns.sum())
 
-        self.interface = CistromeEmbeddingManager(mtx_mask=mtx_mask)
-        n_factors = self.interface.normalized_mtx_mask.shape[1]
+        print(f"Number of factors after filtering: {n_factors}")
         self.res1 = ResidualBlock(n_factors, 1024, dropout=dropout)
         self.res2 = ResidualBlock(1024, H, dropout=dropout)
         self.conv = nn.Conv2d(1, 1, kernel_size=(1, H), stride=(1, 1))
@@ -307,7 +315,11 @@ class MultiWindowHeaderFusion(nn.Module):
         self.fc = nn.Linear(medium_dim, num_labels)
 
     def _post_transformer(self, x):
-        x = self.interface(x)  # (B, L, n_factors)
+        if self.filter_by is None:
+            x = self.interface(x)  # (B, L, n_factors)
+        else:
+            filter_columns = np.load(self.filter_by)[0].astype(bool)
+            x = x[:, filter_columns, :]  # (B, L, n_factors)
         x = x.permute(0, 2, 1)
         x = self.res1(x)
         x = self.res2(x)
@@ -343,11 +355,39 @@ class MultiWindowHeaderFusion(nn.Module):
     def freeze_backbone(self):
         for p in self.chrombert.parameters():
             p.requires_grad = False
-        for p in self.interface.parameters():
-            p.requires_grad = False
+        
+        if self.filter_by is None:
+            for p in self.interface.parameters():
+                p.requires_grad = False
         print("Backbone frozen")
 
     def unfreeze_backbone(self, unfreeze_layers=3):
         for p in self.chrombert.encoder_layers[-unfreeze_layers:].parameters():
             p.requires_grad = True
         print(f"Last {unfreeze_layers} encoder layers unfrozen")
+
+
+class MLPMultiRegressor:
+    
+    def __init__(self, input_dim, num_labels, hidden_dims=[512, 256]):
+        
+        self.input_tokenizer = nn.Embedding(5,input_dim) 
+        self.exp_embedding = nn.Embedding(2689, input_dim)
+        
+        self.model = nn.Sequential(
+            nn.Linear(input_dim*2, hidden_dims[0]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[1], num_labels)
+        )
+        
+    def forward(self, x):
+        
+        pos_emb = self.exp_embedding(torch.arange(x.size(1), device=x.device).unsqueeze(0))
+        out = self.input_tokenizer(x) + pos_emb
+        
+        print("out shape:", out.shape)
+        out = self.model(out)
+        
+        return out

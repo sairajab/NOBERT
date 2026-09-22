@@ -32,7 +32,7 @@ from distributed_utils import (
 )
 
 # ================= CONFIGURATION =================
-VOCAB_SIZE = 6  # 0: PAD, 1-4: Labels, 5: MASK
+VOCAB_SIZE = 7 # 6 for older models  # 0: PAD, 1-4: Labels, 5: MASK
 EMBED_DIM = 768
 N_HEADS = 8
 N_LAYERS = 8
@@ -64,6 +64,17 @@ DATASET_CONFIGS = {
         "n_windows":     1,
         "pretrain_datafile": "bins500bp_labels.parquet",
         "pretrain_modelpath": "../../chromBERT_models_all_clusters500_new",
+    },
+        "2500bp_5emb": {
+        "dataset_cls":   EnhancersDataset2500,
+        "data_path":     "../../DATA/enhancers/enhances_full_500_5_chrombert_style_final.csv",
+        "labels_path":   "../../DATA/enhancers/C1_2500_enhancer_dataset.txt" , # C1_2500_enhancer_dataset.txt",enhancers_2500_labels_no_duplicates
+        "split_file":    None,   # splits come from the labels file's Split column
+        "stride":        500,
+        "window_size":   500,
+        "n_windows":     1,
+        "pretrain_datafile": "bins500_chrombert.parquet",
+        "pretrain_modelpath": "../../chromBERT_models_all_clusters500_5emb",
     },
 }
 
@@ -547,14 +558,14 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_version", choices=["200bp", "2500bp"], default="2500bp")
+    parser.add_argument("--dataset_version", choices=["200bp", "2500bp"], default="2500bp_5emb")
     parser.add_argument("--pick_closest_bin", action="store_true", default=False)
     parser.add_argument("--pretrain_modelpath", default=None,
                         help="Override the ChromBERT backbone checkpoint directory for the chosen dataset config")
     parser.add_argument("--base_dir", default="/s/chromatin/c/nobackup/Saira/BERTModel/NOBERT/results/chrombert_finetune/")
     parser.add_argument("--output_dir", default=None,
                         help="If not given, auto-named from base_dir/dataset_version/n_windows")
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--phase1_epochs", type=int, default=2)
     parser.add_argument("--phase2_epochs", type=int, default=30)
     parser.add_argument("--lr_phase1", type=float, default=1e-5)
@@ -567,6 +578,8 @@ if __name__ == "__main__":
     parser.add_argument("--unfreeze_layers", type=int, default=3)
     parser.add_argument("--use_weighted_sampler", action="store_true", default=False)
     parser.add_argument("--wandb_project", default="chromBERT-finetune")
+    parser.add_argument("--filter_by", type=str, default=None,
+                        help="Optional filter for the dataset features")
     args = parser.parse_args()
 
     device, local_rank = setup_distributed()
@@ -629,6 +642,7 @@ if __name__ == "__main__":
             n_windows=n_windows,
             pick_closest_bin=args.pick_closest_bin,
             pretrain_datapath=cfg["pretrain_datafile"],
+           
         )
     splits = dataset_full.create_splits_from_labels_data()
 
@@ -697,7 +711,7 @@ if __name__ == "__main__":
 
     chrombert_model = base_model.to(device)
     print("N windows used in model:", n_windows)
-    model = MultiWindowHeaderFusion(chrombert_model, num_labels=2, dropout=0.2, n_windows=n_windows).to(device)
+    model = MultiWindowHeaderFusion(chrombert_model, num_labels=2, dropout=0.2, n_windows=n_windows, filter_by=args.filter_by if hasattr(args, "filter_by") else None).to(device)
 
     model = run_training(
         model, train_loader, val_loader, test_loader, device, local_rank, outdir,

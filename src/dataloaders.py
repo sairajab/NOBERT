@@ -7,6 +7,7 @@ import pandas as pd
 import os
 import time
 from collections import defaultdict, Counter
+import h5py
 
 PAD_TOKEN = 0
 MASK_TOKEN = 5
@@ -322,8 +323,6 @@ class EnhancersDatasetFast(Dataset):
                 "Found columns: " + str(track_df.columns[:5].tolist())
             )
 
-
- 
         actual_col = track_df['actual'].values
         window_index = track_df.index.values  # window coordinates
         feature_cols = [c for c in track_df.columns if c != 'actual']
@@ -458,7 +457,7 @@ class EnhancersDatasetFast(Dataset):
             if len(windows) > self.n_windows:
                 pick_mid = len(windows) // 2
                 windows = [windows[pick_mid]]
-                print(f"  Sample {name} has {len(row_indices)} windows, picking middle one")
+                #print(f"  Sample {name} has {len(row_indices)} windows, picking middle one")
         else:
             print(f"Warning: No windows for {name} at idx {idx}")
             windows = [self._zero]
@@ -466,6 +465,7 @@ class EnhancersDatasetFast(Dataset):
         # pick max of windows if more than one
 
 
+        #print(f"  Sample {name} has {len(windows)} windows, taking max across them")
         data = torch.from_numpy(np.stack(windows))
         #### temporary fix: take max across windows to reduce to single feature vector
         data = torch.max(data, dim=0)[0]  # take max across windows
@@ -726,3 +726,305 @@ class EnhancersDataset(torch.utils.data.Dataset):
         label = torch.tensor(label, dtype=torch.long)
         data = torch.tensor(np.stack(windows), dtype=torch.float32)
         return name,  data, label
+    
+
+class SimpleEnhancersDataset(Dataset):
+ 
+    def __init__(self, track_matrix_path, labels_file_path, pretrain_datapath=None,
+                 split_file="/s/chromatin/a/nobackup/Saira/SPLICE_SITE_PREDICTION/src/enhancers_split.csv", filter_by=None):
+ 
+        self.split_file = split_file
+        self.num_labels = 2
+        self.filter_by = filter_by
+        if self.filter_by is not None:
+            filter_columns =  np.load(self.filter_by)[0]
+            print("loaded mask for filtering features ", filter_columns.sum(), filter_columns.shape)
+ 
+        # ── Load labels ──
+        if self.split_file is not None:
+            self.labels_data = pd.read_csv(labels_file_path, sep='\t')
+        else:
+            self.labels_data = pd.read_csv(
+                labels_file_path, sep='\t',
+                names=['Chromosome', 'Start', 'End', 'Split', 'FeatureType', 'Label']
+            )
+ 
+        print(self.labels_data.head())
+        print(f"NaN labels: {self.labels_data['Label'].isna().sum()}")
+        non_finite = self.labels_data[~np.isfinite(self.labels_data['Label'])]
+        if len(non_finite) > 0:
+            print(f"Non-finite labels: {len(non_finite)}")
+            print(non_finite.head())
+        self.labels_data['Label'] = self.labels_data['Label'].astype(int)
+ 
+        # ── Load track matrix ──
+        print(f"\nLoading track matrix from {track_matrix_path}...")
+        t0 = time.time()
+ 
+        if track_matrix_path.endswith('.parquet'):
+            track_df = pd.read_parquet(track_matrix_path)
+        else:
+            track_df = pd.read_csv(track_matrix_path, index_col=0)
+ 
+        print(f"  Loaded in {time.time()-t0:.1f}s: {track_df.shape}")
+        print(track_df.head())
+ 
+        # ── Separate 'actual' column from features ──
+        if 'actual' not in track_df.columns:
+            raise ValueError(
+                "Track matrix must have an 'actual' column. "
+                "Found columns: " + str(track_df.columns[:5].tolist())
+            )
+
+        actual_col = track_df['actual'].values
+        window_index = track_df.index.values  # window coordinates
+        feature_cols = [c for c in track_df.columns if c != 'actual']
+        self.n_features = len(feature_cols)
+        print(f"  Features: {self.n_features}")
+        if self.filter_by is not None:
+            feature_cols = [col for col, keep in zip(feature_cols, filter_columns) if keep==1]
+            self.n_features = len(feature_cols)
+        print(f"  Filtered features: {self.n_features}")
+        self.feature_values = track_df[feature_cols].values.astype(np.float32)
+        print(f"  Feature values shape: {self.feature_values.shape}")
+       
+         
+        print(f"  Sample: window={window_index[0]} -> actual={actual_col[0]}")
+ 
+        # ── Build lookup: actual_key -> sorted list of (window_start, row_idx) ──        
+        print("Building lookup...")
+
+        self.actual_to_row = {
+            actual_key: row_idx
+            for row_idx, actual_key in enumerate(actual_col)
+        }
+
+
+        print(f"Unique regions: {len(self.actual_to_row):,}")
+
+        # ── Map labels to track-matrix rows ──
+        print("Mapping samples...")
+
+        self.sample_row_indices = []
+        matched = 0
+        missing = 0
+
+        for _, row in self.labels_data.iterrows():
+
+            actual_key = (
+                f"{row['Chromosome']}:{int(row['Start'])}-{int(row['End'])}"
+            )
+
+            row_idx = self.actual_to_row.get(actual_key)
+
+            if row_idx is not None:
+                self.sample_row_indices.append(row_idx)
+                matched += 1
+            else:
+                self.sample_row_indices.append(None)
+                missing += 1
+                if missing <= 5:
+                    print(f"No match: {actual_key}")
+
+        print(
+            f"Matched: {matched:,}/{len(self.labels_data):,} "
+            f"({100 * matched / len(self.labels_data):.1f}%)"
+        )
+
+        if missing > 0:
+            print(f"Missing: {missing:,}")
+ 
+    def __len__(self):
+        return len(self.labels_data)
+ 
+    def create_splits_from_labels_data(self):
+        splits = {"train": [], "val": [], "test": []}
+        for idx in range(len(self.labels_data)):
+            row = self.labels_data.iloc[idx]
+            split = str(row['Split']).strip().lower()
+            if split in ["val", "validation"]:
+                split = "val"
+            if split in splits:
+                splits[split].append(idx)
+            else:
+                splits["train"].append(idx)
+ 
+        for k, v in splits.items():
+            print(f"{k}: {len(v)} samples")
+        return splits
+ 
+    def create_splits_from_data(self, split_file=None):
+        if split_file is None:
+            split_file = self.split_file
+ 
+        split_df = pd.read_csv(split_file)
+        seq_to_split = {}
+        for _, row in split_df.iterrows():
+            seq_to_split[(row['chrom'], row['start'], row['end'])] = row['split']
+ 
+        splits = {"train": [], "val": [], "test": []}
+        missed = 0
+        for idx in range(len(self.labels_data)):
+            data = self.labels_data.iloc[idx]
+            seq_key = (data['Chromosome'], data['Start'], data['End'])
+            split = seq_to_split.get(seq_key, "train")
+            if split in splits:
+                splits[split].append(idx)
+            else:
+                missed += 1
+ 
+        if missed:
+            print(f"Warning: {missed} sequences not in split file, assigned to train")
+        return splits
+ 
+    def get_labels(self, idx):
+        return self.labels_data.iloc[idx]['Label']
+ 
+    def __getitem__(self, idx):
+
+        row = self.labels_data.iloc[idx]
+
+        chrom = str(row['Chromosome'])
+        start = int(row['Start'])
+        end = int(row['End'])
+        label = int(row['Label'])
+
+        name = f"{chrom}:{start}-{end}"
+        row_idx = self.sample_row_indices[idx]
+
+        data = self.feature_values[row_idx]
+        data = torch.from_numpy(data)
+        data = data.unsqueeze(0)
+        label = torch.tensor(label, dtype=torch.long)
+
+        return name, data, label
+        
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GeneExpression Dataset
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GeneExpressionDataset(Dataset):
+    def __init__(self, cont_matrix_path, disc_matrix_path, labels_file, filter_by = None):
+        super().__init__()
+
+        self.cont_matrix_path = cont_matrix_path
+        self.disc_matrix_path = disc_matrix_path
+        self.labels_file = labels_file
+        self.filter_by = None
+        if filter_by is not None:
+            self.filter_by = np.load(filter_by)[0]
+
+        with h5py.File(self.labels_file, 'r') as f:
+            self.fpkm_vals = f['FPKM_matrix'][:]
+            self.gene_chrom = f['chrom_geneid'][:]
+
+        assert len(self.fpkm_vals) == len(self.gene_chrom), \
+            f"Label/index length mismatch: {len(self.fpkm_vals)} labels vs {len(self.gene_chrom)} gene_chrom entries"
+
+        self.load_input_matrices(cont=False)
+
+    def load_input_matrices(self, cont=False):
+        if cont:
+            self.cont_matrix = pd.read_parquet(self.cont_matrix_path)
+        else:
+            self.cont_matrix = None
+
+        self.disc_matrix = pd.read_csv(self.disc_matrix_path, index_col=0)
+        print("Original disc_matrix columns:", self.disc_matrix.columns.tolist())
+        if 'window.1' in self.disc_matrix.columns:
+            print("Dropping duplicate 'window.1' column from disc_matrix.")
+            self.disc_matrix = self.disc_matrix.drop(columns=['window.1'])
+        if self.filter_by is not None:
+            feature_cols = [c for c in self.disc_matrix.columns if c != 'actual']
+            feature_cols = [col for col, keep in zip(feature_cols, self.filter_by) if keep==1]
+            
+            
+            print(f"Filtering disc_matrix to {np.sum(self.filter_by)} features based on filter_by mask.")
+            self.disc_matrix = self.disc_matrix[feature_cols]
+            print("Filtered disc_matrix columns:", len(self.disc_matrix.columns), "features remaining.")
+        self.index = self.disc_matrix.index.tolist()
+
+        self.gene_to_start = defaultdict(int)
+        self.map_index = defaultdict(list)
+
+        for idx in self.index:
+            chrom, other, rest = idx.split(":")
+            strand = int(rest.split("|")[-1])
+            gene, start = other.split("|")
+            if strand == -1:
+                start = rest.split("|")[0]
+            self.gene_to_start[(gene, chrom)] = start
+            self.map_index[(gene, chrom)].append(idx)
+
+        print("Sample gene_to_start keys:", list(self.gene_to_start.items())[:5])
+
+    def load_splits(self, split_path="gene expression/"):
+        train_path = split_path + "Train.txt"
+        val_path   = split_path + "Val.txt"
+        test_path  = split_path + "Test.txt"
+
+        train_ids, val_ids, test_ids = set(), set(), set()
+
+        for path, id_set in [(train_path, train_ids), (val_path, val_ids), (test_path, test_ids)]:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    gene, chrom, start = line.split("_")
+                    id_set.add((gene, f"Chr{chrom}", start))
+
+        train_indices, val_indices, test_indices = [], [], []
+        missing = 0
+        print("split size", len(train_ids), len(val_ids), len(test_ids))
+
+        for j in range(len(self.gene_chrom)):
+            arr = self.gene_chrom[j]
+            chrom   = f"Chr{arr[0].decode()}"
+            gene_id = arr[1].decode()
+            start   = self.gene_to_start.get((gene_id, chrom))
+            key     = (gene_id, chrom, start)
+            matched = False
+
+            if key in train_ids:
+                train_indices.append(j); matched = True
+            elif key in val_ids:
+                val_indices.append(j);   matched = True
+            elif key in test_ids:
+                test_indices.append(j);  matched = True
+
+            if not matched:
+                if missing < 10:
+                    print("Sample lookup key:", key)
+                missing += 1
+
+        print("Missing", missing)
+        return {"train": train_indices, "val": val_indices, "test": test_indices}
+
+    def __len__(self):
+        return len(self.gene_chrom)
+
+    def __getitem__(self, idx):
+        sample  = self.gene_chrom[idx]
+        chrom   = f"Chr{sample[0].decode()}"
+        gene_id = sample[1].decode()
+
+        matrix_indices = self.map_index.get((gene_id, chrom), [])
+
+        if len(matrix_indices) == 0:
+            print(f"Warning: Gene {gene_id} on {chrom} not found in map_index.")
+            n_features = self.disc_matrix.shape[1]
+            data = torch.zeros((1, n_features), dtype=torch.long)
+        else:
+            data = torch.tensor(
+                self.disc_matrix.loc[matrix_indices].values,
+                dtype=torch.long
+            )
+
+        # get max
+        data = data.max(dim=0, keepdim=True).values
+        labels = torch.log1p(torch.tensor(self.fpkm_vals[idx], dtype=torch.float32))
+        
+        return gene_id, data, labels
+
