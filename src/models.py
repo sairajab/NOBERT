@@ -367,6 +367,96 @@ class MultiWindowHeaderFusion(nn.Module):
         print(f"Last {unfreeze_layers} encoder layers unfrozen")
 
 
+class ClassificationHeadOnly(nn.Module):
+    """Shared finetuning head: ChromBERT backbone -> cistrome interface ->
+    residual MLP stack -> linear output layer.
+
+    `num_labels` and the loss/activation applied to its output are the only
+    task-specific pieces: binary classification uses num_labels=2 logits with
+    CrossEntropyLoss, multi-task regression uses num_labels=n_experiments
+    continuous outputs with MSELoss.
+    """
+
+    def __init__(self,num_labels,
+                 mtx_mask="/s/chromatin/c/nobackup/Saira/BERTModel/mtx_mask.txt",
+                 n_windows=1, dropout=0.1, medium_dim=256, filter_by = None, embed_dim = 768, vocab_size = 6):
+        super().__init__()
+        self.windows = n_windows
+        H = 768 * n_windows
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=PAD_TOKEN)
+        self.exp_embedding = nn.Embedding(MAX_SEQ_LEN, embed_dim)
+                # In __init__:
+        self.embed_dropout = nn.Dropout(0.1)
+
+        if self.windows != 1:
+            self.pos_embedding = SinusoidalPositionalEncoding(hidden_dim=768, num_slots=n_windows)
+        
+        
+        self.filter_by = filter_by
+        if filter_by is None:
+            self.interface = CistromeEmbeddingManager(mtx_mask=mtx_mask)
+            n_factors = self.interface.normalized_mtx_mask.shape[1]
+        else:
+            filter_columns = np.load(filter_by)[0].astype(bool)
+            n_factors = int(filter_columns.sum())
+        n_factors = 2689
+        
+        print(f"Number of factors after filtering: {n_factors}")
+        self.res1 = ResidualBlock(n_factors, 1024, dropout=dropout)
+        self.res2 = ResidualBlock(1024, H, dropout=dropout)
+        self.conv = nn.Conv2d(1, 1, kernel_size=(1, H), stride=(1, 1))
+        nn.init.xavier_uniform_(self.conv.weight)
+        nn.init.constant_(self.conv.bias, 0.1)
+
+        self.activation = nn.ReLU()
+        self.res3 = ResidualBlock(H, medium_dim, dropout=dropout)
+        self.fc = nn.Linear(medium_dim, num_labels)
+
+    def _post_transformer(self, x):
+        # if self.filter_by is None:
+        #     x = self.interface(x)  # (B, L, n_factors)
+        # else:
+        #     filter_columns = np.load(self.filter_by)[0].astype(bool)
+        #     x = x[:, filter_columns, :]  # (B, L, n_factors)
+        x = x.permute(0, 2, 1)
+        x = self.res1(x)
+        x = self.res2(x)
+        x = x[:, None, :, :]
+        x = self.conv(x)
+        x = self.activation(x)
+        x = x.view(x.shape[0], -1)
+        return x
+
+    def forward(self, x, attention_mask=None, return_emb=False):
+        """
+        x   : (B, n_windows, MAX_SEQ_LEN)  long tokens
+        attention_mask: (B, n_windows)     bool — True = real window (unused by
+            the backbone today; kept for API symmetry with other heads).
+        """
+        B, W, L = x.shape
+        x = x.view(B * W, L)                            # flatten for BERT
+        positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        # print("x shape:", x.shape, positions.shape, "embedding shape:", self.embedding(x).shape)
+        # print("pos_embedding shape:", self.exp_embedding(positions).shape)
+        x = self.embedding(x) + self.exp_embedding(positions)
+        x = self.embed_dropout(x)
+                
+        x = x.reshape(B, W, L, -1).permute(0, 2, 1, 3)   # (B, L, W, 768)
+        x = x.reshape(B, L, W * 768)                     # (B, L, W*768)
+
+        if self.windows != 1:
+            x = self.pos_embedding(x)
+
+        x   = self._post_transformer(x)
+        x   = self.res3(x)
+        out = self.fc(x)
+        
+        return out
+
+
+
+
+
 class MLPMultiRegressor:
     
     def __init__(self, input_dim, num_labels, hidden_dims=[512, 256]):

@@ -362,7 +362,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     if args.outdir is None:
-        args.outdir = os.path.join("../results/gene_expression_baselines", args.model)
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        args.outdir = os.path.join(src_dir, "..", "results", "gene_expression_baselines", args.model)
     os.makedirs(args.outdir, exist_ok=True)
 
     np.random.seed(args.seed)
