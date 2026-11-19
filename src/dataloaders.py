@@ -14,16 +14,22 @@ MASK_TOKEN = 5
 MASK_PROB = 0.15
 
 class ChromBERTDataset(Dataset):
-    def __init__(self, parquet_path, mask_mode="dynamic", num_masks=7, cache_dir="mask_cache_200"):
+    def __init__(self, parquet_path, mask_mode="dynamic", num_masks=7, cache_dir="mask_cache_200",
+                 mask_token=MASK_TOKEN, random_tokens=(1, 2, 3, 4),
+                 cluster_file="/s/chromatin/c/nobackup/Saira/BERTModel/DATA/pretraining/experiment_clusters_pearson.tsv"):
         """
-        mask_mode: 
+        mask_mode:
             "dynamic"    - create new structured masks every __getitem__ call
             "precomputed" - precompute num_masks per sample, save to disk, cycle per epoch
             "precomputed_all" - precompute num_masks per sample, num_masks * x dataset size per epoch
+        mask_token    : token used for [MASK] (5 for 4-token data, 6 for 5-token data)
+        random_tokens : tokens used for the 10% random replacement
+        NOTE: a cache in cache_dir is reused as-is, so num_masks must match the cache it was built with.
         """
         df = pd.read_parquet(parquet_path)
         self.data = df.values.astype(np.int8)
-        self.labels = torch.tensor([1, 2, 3, 4])
+        self.mask_token = mask_token
+        self.labels = torch.tensor(list(random_tokens))
         self.ids = df.index.tolist()
         self.seq_len = self.data.shape[1]
         self.n_samples = self.data.shape[0]
@@ -32,7 +38,7 @@ class ChromBERTDataset(Dataset):
         self.current_mask_idx = 0  # for "precomputed" mode epoch cycling
 
         # Load cluster info
-        self.cluster_df = pd.read_csv("/s/chromatin/c/nobackup/Saira/BERTModel/DATA/pretraining/experiment_clusters_pearson.tsv", sep="\t")
+        self.cluster_df = pd.read_csv(cluster_file, sep="\t")
         self.experiment_to_cluster = dict(
             zip(self.cluster_df["experiment"], self.cluster_df["cluster"])
         )
@@ -115,7 +121,7 @@ class ChromBERTDataset(Dataset):
         probs = torch.rand(len(all_masked))
 
         mask_token_mask = probs < 0.8
-        seq[all_masked[mask_token_mask]] = MASK_TOKEN
+        seq[all_masked[mask_token_mask]] = self.mask_token
 
         random_token_mask = (probs >= 0.8) & (probs < 0.9)
         if random_token_mask.any():
@@ -137,26 +143,46 @@ class ChromBERTDataset(Dataset):
         tgt_path = os.path.join(cache_dir, "targets.npy")
 
         if os.path.exists(seq_path) and os.path.exists(tgt_path):
+            expected = N * self.num_masks * S  # int8 -> 1 byte per token
+            if os.path.getsize(seq_path) != expected:
+                raise ValueError(
+                    f"{seq_path} has {os.path.getsize(seq_path)} bytes, expected {expected} for "
+                    f"num_masks={self.num_masks}. Wrong num_masks for this cache?")
             print(f"Loading precomputed masks from {cache_dir}/")
             self.masked_seqs = np.memmap(seq_path, dtype=np.int8, mode="r", shape=(N, self.num_masks, S))
             self.targets = np.memmap(tgt_path, dtype=np.int16, mode="r", shape=(N, self.num_masks, S))
+
+            # an unfinished precompute leaves all-zero rows (real data has no PAD tokens), check a spread of bins
+            check = np.linspace(0, N - 1, 200).astype(int)
+            empty = [i for i in check if not self.masked_seqs[i, 0].any()]
+            if empty:
+                raise ValueError(
+                    f"{cache_dir} is incomplete: {len(empty)}/{len(check)} checked bins are empty "
+                    f"(first at bin {empty[0]}). The precompute was probably interrupted. "
+                    f"Delete it or use a new cache_dir to rebuild.")
         else:
+            # write to temp files and rename at the end, so an interrupted run never looks complete
             print(f"Precomputing {self.num_masks} structured masks per sample...")
-            self.masked_seqs = np.memmap(seq_path, dtype=np.int8, mode="w+", shape=(N, self.num_masks, S))
-            self.targets = np.memmap(tgt_path, dtype=np.int16, mode="w+", shape=(N, self.num_masks, S))
+            seqs = np.memmap(seq_path + ".tmp", dtype=np.int8, mode="w+", shape=(N, self.num_masks, S))
+            tgts = np.memmap(tgt_path + ".tmp", dtype=np.int16, mode="w+", shape=(N, self.num_masks, S))
 
             for i in range(N):
                 seq = torch.from_numpy(self.data[i]).long()
                 for m in range(self.num_masks):
                     masked_seq, target = self._structured_mask(seq)
-                    self.masked_seqs[i, m] = masked_seq.numpy().astype(np.int8)
-                    self.targets[i, m] = target.numpy().astype(np.int16)
+                    seqs[i, m] = masked_seq.numpy().astype(np.int8)
+                    tgts[i, m] = target.numpy().astype(np.int16)
 
                 if (i + 1) % 10000 == 0:
-                    print(f"  {i+1}/{N} samples done")
+                    print(f"  {i+1}/{N} samples done", flush=True)
 
-            self.masked_seqs.flush()
-            self.targets.flush()
+            seqs.flush()
+            tgts.flush()
+            del seqs, tgts
+            os.replace(seq_path + ".tmp", seq_path)
+            os.replace(tgt_path + ".tmp", tgt_path)
+            self.masked_seqs = np.memmap(seq_path, dtype=np.int8, mode="r", shape=(N, self.num_masks, S))
+            self.targets = np.memmap(tgt_path, dtype=np.int16, mode="r", shape=(N, self.num_masks, S))
             print("Precomputation done and saved to disk.")
 
     def set_epoch(self, epoch):
@@ -1028,3 +1054,157 @@ class GeneExpressionDataset(Dataset):
         
         return gene_id, data, labels
 
+ 
+
+class EnhancersDatasetClassicalSimple(SimpleEnhancersDataset):
+
+    def get_sklearn_data(self, indices=None):
+        print("feature_values shape: ", self.feature_values.shape)
+        if indices is None:
+            indices = range(len(self.labels_data))
+
+        X = []
+        y = []
+
+        for idx in indices:
+            row_idx = self.sample_row_indices[idx]
+            if row_idx is None:
+                continue
+
+            feat = self.feature_values[row_idx]
+            #X = to_unit_vector(X) # when doing unit vector normalization
+
+            X.append(feat)
+            y.append(int(self.labels_data.iloc[idx]['Label']))
+            
+        
+
+        return np.stack(X), np.array(y, dtype=np.int64)
+
+    def get_split_sklearn_data(self, use_split_file=False):
+
+        if use_split_file and self.split_file is not None:
+            splits = self.create_splits_from_data()
+        else:
+            splits = self.create_splits_from_labels_data()
+
+        result = {}
+
+        for split_name, idxs in splits.items():
+            X, y = self.get_sklearn_data(indices=idxs)
+            result[split_name] = (X, y)
+
+            print(
+                f"{split_name}: X{X.shape}, y{y.shape}, "
+                f"pos={y.sum()}, neg={len(y)-y.sum()}"
+            )
+
+        return result
+
+    def __getitem__(self, idx):
+
+        row = self.labels_data.iloc[idx]
+
+        chrom = str(row['Chromosome'])
+        start = int(row['Start'])
+        end = int(row['End'])
+        label = int(row['Label'])
+
+        name = f"{chrom}:{start}-{end}"
+
+        row_idx = self.sample_row_indices[idx]
+        if row_idx is None:
+            raise ValueError(f"No row index for sample {name}")
+        data = self.feature_values[row_idx]
+        
+        #
+        data = torch.from_numpy(data)
+        data = data.unsqueeze(0)  # (1, n_features)
+
+        label = torch.tensor(label, dtype=torch.long)
+
+        return name, data, label
+
+
+class EnhancersDatasetClassical(EnhancersDatasetFast):
+    """Multi-window version of the classical dataset (several windows per region,
+    aggregated into one feature vector). Used in feature_importance.ipynb."""
+
+    def _aggregate_windows(self, row_indices, method="middle"):
+        if not row_indices:
+            base = self._zero
+            if method == "concat":
+                return np.tile(base, self.n_windows)
+            elif method == "stats":
+                return np.concatenate([base, base, base, base])
+            return base.copy()
+
+        mat = self.feature_values[row_indices]
+
+        if method == "mean":
+            return mat.mean(axis=0)
+        elif method == "max":
+            return mat.max(axis=0)
+        elif method == "middle":
+            return mat[len(mat) // 2]
+        elif method == "concat":
+            if len(mat) >= self.n_windows:
+                mid = len(mat) // 2
+                half = self.n_windows // 2
+                start = mid - half
+                mat = mat[start:start + self.n_windows]
+            else:
+                pad = np.zeros((self.n_windows - len(mat), self.n_features), dtype=np.float32)
+                mat = np.vstack([mat, pad])
+            return mat.ravel()
+        elif method == "stats":
+            return np.concatenate([
+                mat.mean(axis=0), mat.std(axis=0),
+                mat.min(axis=0), mat.max(axis=0),
+            ])
+        else:
+            raise ValueError(f"Unknown aggregation method: {method}")
+
+    def get_sklearn_data(self, indices=None, aggregation="mean"):
+        if indices is None:
+            indices = list(range(len(self.labels_data)))
+        X_list, y_list = [], []
+        for idx in indices:
+            feat = self._aggregate_windows(self.sample_row_indices[idx], method=aggregation)
+            X_list.append(feat)
+            y_list.append(int(self.labels_data.iloc[idx]['Label']))
+        return np.stack(X_list), np.array(y_list, dtype=np.int64)
+
+    def get_split_sklearn_data(self, aggregation="mean", use_split_file=False):
+        if use_split_file and self.split_file is not None:
+            splits = self.create_splits_from_data()
+        else:
+            splits = self.create_splits_from_labels_data()
+
+        result = {}
+        for split_name, idxs in splits.items():
+            X, y = self.get_sklearn_data(indices=idxs, aggregation=aggregation)
+            result[split_name] = (X, y)
+            print(f"  {split_name}: X{X.shape}, y{y.shape}, "
+                  f"pos={y.sum()}, neg={len(y)-y.sum()}")
+        return result
+
+    def __getitem__(self, idx):
+        row = self.labels_data.iloc[idx]
+        chrom = str(row['Chromosome'])
+        start = int(row['Start'])
+        end = int(row['End'])
+        label = int(row['Label'])
+        name = f"{chrom}:{start}-{end}"
+
+        row_indices = self.sample_row_indices[idx]
+        if row_indices:
+            windows = [self.feature_values[ri] for ri in row_indices]
+            if len(windows) > self.n_windows:
+                windows = [windows[len(windows) // 2]]
+        else:
+            windows = [self._zero]
+
+        data = torch.from_numpy(np.stack(windows))
+        label = torch.tensor(label, dtype=torch.long)
+        return name, data, label

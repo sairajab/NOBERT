@@ -4,7 +4,8 @@ baselines_enhancers.py
 ======================
 SVM (linear + rbf) and XGBoost baselines for enhancer classification, to compare against ChromBERT.
 
-Input  : discretized chromatin tokens (1-4) for the 500bp window centered on each region, 2689 tracks
+Input  : discretized chromatin tokens (1-5) for the 500bp window centered on each region, 2689 tracks
+         (same track matrix as ChromBERT finetuning; --track_matrix to use another, e.g. the 4-token one)
 Target : enhancer (1) vs background (0)
 
 Datasets (--dataset)
@@ -25,8 +26,8 @@ Usage
   python baselines_enhancers.py --dataset all --grid           # redo grid search (CV on train) instead of saved best params
   python baselines_enhancers.py --dataset c1  --eval_only      # reload saved models from outdir, redo metrics + plots
 
-Defaults reproduce ../results/final_enhancers_* (best params from earlier grid search,
-final models trained on train+val, evaluated on test).
+Hyperparameters are the best params from an earlier grid search (same as ../results/final_enhancers_*
+and 5_embeddings_C1_dna). Final models are trained on train+val and evaluated on test.
 
 Output (in --output_dir, default ../results/enhancers_<dataset>_<features>)
   svm_model_linear.joblib, svm_model_rbf.joblib, xgb_model_l2.joblib
@@ -58,24 +59,11 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
-SRC_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SRC_DIR)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataloaders import EnhancersDatasetClassicalSimple
+from config import SRC_DIR, ENH_DIR as DATA_DIR, ENH_DATASETS as DATASETS, FEATURE_MASKS as FEATURES
+from config import ENH_TRACKS_5TOK as TRACK_MATRIX  # tokens 1-5, same input as ChromBERT finetuning
 
-
-DATA_DIR = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/enhancers"
-TRACK_MATRIX = "enhancers_500bp_centered_final.csv"  # tokens 1-4, used for final_enhancers_* runs
-
-DATASETS = {
-    "c1":  "C1_2500_enhancer_dataset.txt",
-    "all": "enhancers_2500_labels_no_duplicates.txt",
-}
-FEATURES = {
-    "all":     None,
-    "dna":     "dna_binding_mask.npy",
-    "histone": "histone_mask.npy",
-    "tf":      "tf_mask.npy",
-}
 MODELS = ["svm_linear", "svm_rbf", "xgb"]
 
 # key names in metrics_summary.json (kept same as older runs)
@@ -83,7 +71,7 @@ METRIC_KEY = {"svm_linear": "SVM_test_linear", "svm_rbf": "SVM_test_rbf", "xgb":
 PARAM_KEY  = {"svm_linear": "SVM_linear_params", "svm_rbf": "SVM_rbf_params", "xgb": "XGB_params"}
 MODEL_FILE = {"svm_linear": "svm_model_linear.joblib", "svm_rbf": "svm_model_rbf.joblib", "xgb": "xgb_model_l2.joblib"}
 
-# ---------- best params (from earlier grid search, used for final_enhancers_*) ----------
+# ---------- best params (from earlier grid search, used for final_enhancers_* and 5_embeddings_C1_dna) ----------
 BEST_PARAMS = {
     "svm_linear": {"kernel": "linear", "C": 0.1},
     "svm_rbf":    {"kernel": "rbf", "C": 10, "gamma": "scale"},

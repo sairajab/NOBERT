@@ -1,159 +1,202 @@
-# track_matrix = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/enhancers/enhances_full_500_5_chrombert_style_final.csv"
-# labels_file = "/s/chromatin/c/nobackup/Saira/BERTModel/DATA/enhancers/C1_2500_enhancer_dataset.txt"
+#!/usr/bin/env python3
+"""
+compute_shapley.py
+==================
+SHAP values on the test set for the enhancer baselines trained with baselines_enhancers.py.
 
-import argparse
-import xgboost as xgb
-from train_svm_rf import EnhancersDatasetClassical, EnhancersDatasetClassicalSimple
-import shap
-import pandas as pd
-import sklearn
-import numpy as np
-import matplotlib.pyplot as plt
-import joblib
+  xgb          - TreeExplainer (exact, fast). Values are in log-odds space.
+  svm_linear,
+  svm_rbf      - KernelExplainer on predict_proba (slow, runs in parallel chunks).
+                 Values are in probability space for the positive class.
+
+Uses the same --dataset / --features flags as baselines_enhancers.py, so the data
+matches what the model was trained on. Warns if they don't match args.json in the results dir.
+
+Usage
+  python compute_shapley.py --dataset c1 --features histone
+  python compute_shapley.py --dataset all --features dna --models xgb
+  python compute_shapley.py --dataset c1 --models svm_rbf --n_workers 32 --background_size 10
+
+  # older results dirs
+  python compute_shapley.py --dataset c1 --features histone --results_dir ../results/final_enhancers_histone_c1
+
+Output (in the results dir)
+  {linear,rbf,xgb}_shap_values.csv         raw SHAP values, test samples x features
+  {linear_svm,rbf_svm,xgb}_shap_values_rank.csv
+      per-feature ranking: mean SHAP on positives / negatives, separation, mean |SHAP|,
+      factor name and factor type (sorted by signed_pos)
+"""
+
 import os
+import json
+import time
+import argparse
+
+import numpy as np
+import pandas as pd
+import joblib
+import shap
 from joblib import Parallel, delayed
 
-
-# ---------------------------------------------------------
-# Command-line arguments
-# ---------------------------------------------------------
-parser = argparse.ArgumentParser(description="Compute SHAP values for SVM and XGBoost enhancer models.")
-
-parser.add_argument("--track-matrix", default="/s/chromatin/c/nobackup/Saira/BERTModel/DATA/enhancers/enhances_full_500_5_chrombert_style_final.csv",help="Path to track matrix CSV.")
-parser.add_argument("--labels-file",default="/s/chromatin/c/nobackup/Saira/BERTModel/DATA/enhancers/C1_2500_enhancer_dataset.txt",help="Path to labels file.")
-parser.add_argument("--split-file",default=None, help="Optional split file. Default: use Train/Test/Val information from labels.")
-parser.add_argument("--filter-by",default=None,help="Path to feature mask .npy file. Use 'none' to disable filtering.")
-parser.add_argument("--out-dir",default="5_embeddings_C1_xgb_HM",help="Output directory name under ../results/.")
-parser.add_argument("--models",nargs="+",default=["rbf", "linear", "xgb"],choices=["rbf", "linear", "xgb"],help="Models for which to compute SHAP values.")
-parser.add_argument("--n-workers",type=int,default=None,help="Number of parallel workers for Kernel SHAP. Default: CPU count.")
-parser.add_argument("--background-size",type=int,default=10,help="Number of training samples used as Kernel SHAP background.")
-parser.add_argument("--seed",type=int,default=42,help="Random seed for selecting SHAP background samples.")
-
-args = parser.parse_args()
-
-
-# Configuration
-track_matrix = args.track_matrix
-labels_file = args.labels_file
-split_file = args.split_file
-filter_by = None if args.filter_by.lower() == "none" else args.filter_by
-out_dir = args.out_dir
-models = args.models
-
-results_dir = f"../results/{out_dir}"
-os.makedirs(results_dir, exist_ok=True)
-
-# Dataset
-dataset = EnhancersDatasetClassicalSimple(
-    track_matrix_path=track_matrix,
-    labels_file_path=labels_file,
-    split_file=split_file,
-    filter_by=filter_by
+from dataloaders import EnhancersDatasetClassicalSimple
+from baselines_enhancers import (
+    DATA_DIR, TRACK_MATRIX, DATASETS, FEATURES, MODELS, MODEL_FILE, SRC_DIR, get_split_data,
 )
 
-# Use Split column from labels (Train/Test) by default
-use_split_file = split_file is not None
+METADATA = "/s/chromatin/c/nobackup/Saira/BERTModel/merged_metadata_AT_OCR.csv"
 
-data = dataset.get_split_sklearn_data(use_split_file=use_split_file,)
+# output names (kept same as older runs / feature_importance.ipynb)
+SHAP_FILE = {"svm_linear": "linear_shap_values.csv", "svm_rbf": "rbf_shap_values.csv", "xgb": "xgb_shap_values.csv"}
+RANK_FILE = {"svm_linear": "linear_svm_shap_values_rank.csv", "svm_rbf": "rbf_svm_shap_values_rank.csv",
+             "xgb": "xgb_shap_values_rank.csv"}
 
-X_train, y_train = data["train"]
-X_test, y_test = data["test"]
-X_val, y_val = data["val"]
 
-track_matrix_df = pd.read_csv(track_matrix, index_col=0)
-if 'actual' in track_matrix_df.columns:
-    track_matrix_df = track_matrix_df.drop(columns=['actual'])
-all_columns = track_matrix_df.columns
+def parse_args():
+    parser = argparse.ArgumentParser(description="Compute SHAP values for SVM and XGBoost enhancer models.")
+    parser.add_argument("--dataset", choices=list(DATASETS), default="c1")
+    parser.add_argument("--features", default="all",
+                        help=f"feature set: {list(FEATURES)} or a path to a .npy mask")
+    parser.add_argument("--models", nargs="+", choices=MODELS, default=MODELS)
+    parser.add_argument("--results_dir", default=None,
+                        help="dir with saved models. default: ../results/enhancers_<dataset>_<features>")
+    # overrides
+    parser.add_argument("--track_matrix", default=os.path.join(DATA_DIR, TRACK_MATRIX))
+    parser.add_argument("--labels", default=None, help="labels file. Overrides --dataset")
+    parser.add_argument("--split_file", default=None)
+    parser.add_argument("--metadata", default=METADATA, help="for factor name / type in the rank tables")
+    # kernel SHAP
+    parser.add_argument("--n_workers", type=int, default=None, help="default: all CPUs")
+    parser.add_argument("--background_size", type=int, default=10,
+                        help="number of training samples used as Kernel SHAP background")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-if filter_by is not None:
-    
-    filter_columns = np.load(filter_by).ravel()
-    print("loaded mask for filtering features ",filter_columns.sum(),filter_columns.shape)
-    track_matrix_df = track_matrix_df.loc[:, filter_columns.astype(bool)]
+    if args.labels is None:
+        args.labels = os.path.join(DATA_DIR, DATASETS[args.dataset])
+    args.filter_by = FEATURES.get(args.features, args.features)
+    if args.filter_by is not None and not os.path.isabs(args.filter_by):
+        args.filter_by = os.path.join(SRC_DIR, args.filter_by)
+    if args.results_dir is None:
+        feat_tag = os.path.splitext(os.path.basename(args.features))[0]
+        args.results_dir = os.path.join(SRC_DIR, "..", "results", f"enhancers_{args.dataset}_{feat_tag}")
+    return args
 
-print("track_matrix_df shape: ", track_matrix_df.shape)
 
-index_to_col = dict(zip(range(track_matrix_df.shape[1]), track_matrix_df.columns))
-feature_names = [index_to_col[i] for i in range(len(index_to_col))]
-X_test_df = pd.DataFrame(X_test,columns=feature_names,)
+def check_against_training_args(args):
+    """Warn if the data we load here is not what the model was trained on."""
+    path = os.path.join(args.results_dir, "args.json")
+    if not os.path.exists(path):
+        print(f"  (no args.json in {args.results_dir}, can't check data matches training)")
+        return
+    with open(path) as f:
+        train_args = json.load(f)
 
-# SHAP helper
-def _shap_for_chunk(chunk):
-    return explainer.shap_values(chunk)
+    def base(p):
+        return os.path.basename(p) if p else None
 
-# Compute SHAP
-for model_name in models:
+    for key in ["track_matrix", "labels", "filter_by"]:
+        if base(train_args.get(key)) != base(getattr(args, key)):
+            print(f"  WARNING: {key} differs from training run: "
+                  f"trained on {base(train_args.get(key))}, now using {base(getattr(args, key))}")
 
-    print(f"\n{'=' * 60}")
-    print(f"Computing SHAP values for: {model_name}")
-    print(f"{'=' * 60}")
 
-    if model_name == "xgb":
+def kernel_shap(model, background, X, n_workers):
+    explainer = shap.KernelExplainer(model.predict_proba, data=background)
 
-        bst = joblib.load(f"{results_dir}/xgb_model_l2.joblib")["model"]
-        explainer = shap.TreeExplainer(bst)
-        shap_values = explainer.shap_values(X_test_df)
+    # split test rows into chunks and run them in parallel
+    chunk_size = max(1, len(X) // (n_workers * 4))
+    chunks = [X[i:i + chunk_size] for i in range(0, len(X), chunk_size)]
+    n_workers = min(n_workers, len(chunks))
+    print(f"  Kernel SHAP: {len(X)} rows, {len(chunks)} chunks, {n_workers} workers, "
+          f"background={len(background)}")
 
-    else:
+    results = Parallel(n_jobs=n_workers)(delayed(explainer.shap_values)(c) for c in chunks)
+    shap_values = np.concatenate(results, axis=0)
 
-        model = joblib.load(f"{results_dir}/svm_model_{model_name}.joblib")["model"]
+    # (n_samples, n_features, n_classes) -> keep positive class
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1]
+    elif shap_values.ndim == 3:
+        shap_values = shap_values[:, :, 1]
+    return shap_values
 
-        # Sample random features / background samples
-        rng = np.random.default_rng(args.seed)
 
-        background_size = min(args.background_size,X_train.shape[0])
+def rank_features(shap_values, y, feature_names, metadata):
+    # same ranking as feature_importance.ipynb
+    signed_pos = shap_values[y == 1].mean(axis=0)
+    signed_neg = shap_values[y == 0].mean(axis=0)
+    rank = pd.DataFrame({
+        "feature":    feature_names,
+        "signed_pos": signed_pos,
+        "signed_neg": signed_neg,
+        "separation": signed_pos - signed_neg,
+        "abs_infl":   np.abs(shap_values).mean(axis=0),
+    }).sort_values("signed_pos", ascending=False)
 
-        idx = rng.choice(X_train.shape[0],size=background_size,replace=False)
+    acc_to_factor = dict(zip(metadata["Sample accession number"], metadata["Factor_y"]))
+    acc_to_type = dict(zip(metadata["Sample accession number"], metadata["Factor_type"]))
+    acc = rank["feature"].str.split(".").str[0]
+    rank["factor name"] = [acc_to_factor.get(a, a) for a in acc]
+    rank["factor type"] = [acc_to_type.get(a, "unknown") for a in acc]
+    return rank
 
-        background = X_train[idx]
 
-        explainer = shap.KernelExplainer(model.predict_proba,data=background)
+def main():
+    args = parse_args()
+    print(f"Results dir: {args.results_dir}")
+    check_against_training_args(args)
 
-        # Number of workers
-        n_workers = args.n_workers or os.cpu_count() or 1
+    # Dataset
+    dataset = EnhancersDatasetClassicalSimple(
+        track_matrix_path=args.track_matrix,
+        labels_file_path=args.labels,
+        split_file=args.split_file,
+        filter_by=args.filter_by,
+    )
+    data = get_split_data(dataset, use_split_file=args.split_file is not None)
+    X_train, _, _ = data["train"]
+    X_test, y_test, _ = data["test"]
 
-        # Do not use more workers than chunks
-        chunk_size = max(1,len(X_test_df) // (n_workers * 4))
+    # feature names = track matrix header (minus 'actual'), filtered by the mask
+    feature_names = pd.read_csv(args.track_matrix, index_col=0, nrows=0).columns.drop("actual")
+    if args.filter_by is not None:
+        feature_names = feature_names[np.load(args.filter_by).ravel().astype(bool)]
+    feature_names = list(feature_names)
+    assert len(feature_names) == X_test.shape[1], (len(feature_names), X_test.shape)
 
-        row_chunks = [X_test_df.iloc[i:i + chunk_size]
-            for i in range(0, len(X_test_df), chunk_size)]
+    metadata = pd.read_csv(args.metadata, index_col=0)
 
-        n_workers = min(n_workers, len(row_chunks))
+    # Compute SHAP
+    for name in args.models:
+        print(f"\n{'=' * 60}")
+        print(f"Computing SHAP values for: {name}")
+        print(f"{'=' * 60}")
 
-        print(
-            f"Computing SHAP values for {len(X_test_df)} rows "
-            f"across {len(row_chunks)} chunks "
-            f"on {n_workers} workers"
-        )
+        model = joblib.load(os.path.join(args.results_dir, MODEL_FILE[name]))["model"]
+        t0 = time.time()
 
-        chunk_results = Parallel(n_jobs=n_workers)(
-            delayed(_shap_for_chunk)(chunk)
-            for chunk in row_chunks
-        )
+        if name == "xgb":
+            shap_values = shap.TreeExplainer(model).shap_values(X_test)
+        else:
+            # random training samples as background
+            rng = np.random.default_rng(args.seed)
+            idx = rng.choice(len(X_train), size=min(args.background_size, len(X_train)), replace=False)
+            n_workers = args.n_workers or os.cpu_count() or 1
+            shap_values = kernel_shap(model, X_train[idx], X_test, n_workers)
 
-        shap_values = np.concatenate(
-            chunk_results,
-            axis=0
-        )
+        print(f"  done in {time.time() - t0:.1f}s, shape {shap_values.shape}")
 
-        # shap_values = (n_samples, n_features, n_classes)
-        if isinstance(shap_values, list):
-            shap_values = shap_values[1]
+        # Save SHAP values + ranking
+        out = os.path.join(args.results_dir, SHAP_FILE[name])
+        pd.DataFrame(shap_values, columns=feature_names).to_csv(out, index=False)
+        print(f"  Saved {out}")
 
-        elif shap_values.ndim == 3:
-            shap_values = shap_values[:, :, 1]
+        rank = rank_features(shap_values, y_test, feature_names, metadata)
+        out = os.path.join(args.results_dir, RANK_FILE[name])
+        rank.to_csv(out, index=False)
+        print(f"  Saved {out}")
+        print(rank.head(10)[["feature", "factor name", "factor type", "signed_pos", "abs_infl"]].to_string(index=False))
 
-    # Save SHAP values
-    shap_values_df = pd.DataFrame(shap_values,columns=feature_names)
-    output_file = (f"{results_dir}/{model_name}_shap_values.csv")
-    shap_values_df.to_csv(output_file,index=False)
-    print(f"Saved SHAP values to: {output_file}")
-    
 
-#Usage  
-# python compute_shap.py \
-#     --filter-by new_hm_mask.npy \
-#     --out-dir 5_embeddings_C1_xgb_HM \
-#     --models rbf linear xgb \
-#     --n-workers 32 \
-#     --background-size 10
+if __name__ == "__main__":
+    main()
