@@ -1,288 +1,250 @@
+#!/usr/bin/env python3
+"""
+chrombert_pretrain.py
+=====================
+Pre-train ChromBERT on Arabidopsis chromatin data with masked language modeling (MLM).
+
+Input   : 500bp genome bins x 2689 experiments, each a chromatin state token 1-5
+          (DATA/pretraining/bins500_chrombert.parquet)
+Masking : cluster-structured masking -- whole clusters of correlated experiments are masked
+          together, ~15% of tokens, 80/10/10 (MASK / random token / keep).
+          Masks are precomputed once (--num_masks per bin) and cached in --cache_dir,
+          each epoch sees every bin with all of its masks.
+Loss    : focal loss (gamma=2) on masked positions
+Splits  : bins_500bp.csv (chrom,start,end,...,split). Bins not in the file go to train.
+
+Defaults reproduce chromBERT_models_all_clusters500_5emb/best_genomic_bert.pt
+(8 layers, 8 heads, 768 dim, vocab 7 = PAD + tokens 1-5 + MASK).
+
+Usage
+  python chrombert_pretrain.py                              # single GPU
+  python chrombert_pretrain.py --build_cache_only           # build mask cache first, then:
+  torchrun --nproc_per_node 4 chrombert_pretrain.py         # multi GPU
+  python chrombert_pretrain.py --resume                     # continue from out_dir/best_genomic_bert.pt
+  python chrombert_pretrain.py --max_bins 2000 --epochs 1 --no_compile --out_dir /tmp/test   # quick test
+
+Output (in --out_dir)
+  best_genomic_bert.pt   checkpoint with best val loss (used by finetuning / eval)
+  args.json, history.json (train / val loss per epoch)
+"""
+
 import os
+import json
 import time
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import pandas as pd
+import argparse
+from contextlib import nullcontext
+
 import numpy as np
+import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import get_linear_schedule_with_warmup
-from contextlib import nullcontext
-import torch.backends.cuda
+
+from config import (PRETRAIN_DATA, PRETRAIN_SPLITS, PRETRAIN_CACHE, CLUSTER_FILE, CHROMBERT_DIR,
+                    N_TOKENS, vocab_for)
+from dataloaders import ChromBERTDataset
+from models import ChromBERTModel, load_chrombert, EMBED_DIM, N_HEADS, N_LAYERS
+from utils import FocalLoss, setup, cleanup, is_main_process
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-from dataloaders import ChromBERTDataset
-from models import ChromBERTModel
-from utils import FocalLoss, setup, cleanup, is_main_process, load_splits_data
-# ================= CONFIGURATION =================
-VOCAB_SIZE = 6  # 0: PAD, 1-4: Labels, 5: MASK
-EMBED_DIM = 768
-N_HEADS = 8
-N_LAYERS = 8
-MAX_SEQ_LEN = 2689
-BATCH_SIZE = 256  # Reduced from 32 to fit in 24GB GPU memory
-ACCUMULATION_STEPS = 256 // BATCH_SIZE  # = 64, keeps effective batch size at 256
-MASK_PROB = 0.15
-EPOCHS = 200
-LEARNING_RATE = 1e-4
-PAD_TOKEN = 0
-MASK_TOKEN = 5
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="MLM pre-training of ChromBERT")
+    # data
+    p.add_argument("--data", default=PRETRAIN_DATA, help="parquet: bins x experiments, tokens 1..n_tokens")
+    p.add_argument("--split_file", default=PRETRAIN_SPLITS)
+    p.add_argument("--cache_dir", default=PRETRAIN_CACHE, help="precomputed masks (built if missing)")
+    p.add_argument("--cluster_file", default=CLUSTER_FILE)
+    p.add_argument("--num_masks", type=int, default=10, help="masks per bin, must match an existing cache")
+    p.add_argument("--n_tokens", type=int, default=N_TOKENS, help="chromatin state tokens 1..n_tokens")
+    p.add_argument("--max_bins", type=int, default=None, help="use only N bins per split (quick test)")
+    # model / training
+    p.add_argument("--out_dir", default=CHROMBERT_DIR)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch_size", type=int, default=256, help="per GPU")
+    p.add_argument("--accum_steps", type=int, default=1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--warmup", type=float, default=0.10, help="fraction of steps for linear warmup")
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--resume", action="store_true",
+                   help="start from out_dir/best_genomic_bert.pt (weights only, optimizer restarts)")
+    p.add_argument("--no_compile", action="store_true", help="skip torch.compile (faster start for tests)")
+    p.add_argument("--build_cache_only", action="store_true",
+                   help="only build the mask cache and exit (run with plain python before torchrun)")
+    return p.parse_args()
 
-def run_training(rank, world_size):
 
-    
-    print("Flash SDP enabled:", torch.backends.cuda.flash_sdp_enabled())
-    print("PyTorch version:", torch.__version__)
-    torch.backends.cuda.enable_flash_sdp(True)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_math_sdp(False) 
+def mask_indices(bin_indices, num_masks):
+    # with precomputed_all, dataset item i*num_masks + m = bin i with mask m
+    return [i * num_masks + m for i in bin_indices for m in range(num_masks)]
 
+
+def raw_model(model):
+    # unwrap torch.compile and DDP to get the plain ChromBERTModel
+    model = getattr(model, "_orig_mod", model)
+    return model.module if isinstance(model, DDP) else model
+
+
+def main():
+    args = parse_args()
+    vocab_size, mask_token = vocab_for(args.n_tokens)
+
+    # ── Distributed setup (works with torchrun and plain python) ──
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
     is_distributed = world_size > 1
-
     if is_distributed:
         setup(rank, world_size)
-        device = rank
-        torch.cuda.set_device(rank)
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Running in Single-GPU mode on {device}")
 
-    # Load dataset
-    # 500bp bins // out.parquet for 200bps 
-    #dataset = GenomicBERTDataset("out.parquet", mask_mode = "vae")
-    datapath = "../DATA"
-    dataset = ChromBERTDataset(os.path.join(datapath, "pretraining", "out.parquet"), mask_mode="precomputed_all", num_masks=7, cache_dir="mask_cache_200")
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
-    out_dir = "../chromBERT_models200_allclusters"
-    if is_main_process() and not os.path.exists(out_dir):
-        os.makedirs(out_dir)
-
+    if is_main_process() and not args.build_cache_only:
+        print(f"{'Distributed on ' + str(world_size) + ' GPUs' if is_distributed else 'Single device: ' + str(device)}")
+        print(f"vocab_size={vocab_size} (PAD=0, tokens 1-{args.n_tokens}, MASK={mask_token})")
+        os.makedirs(args.out_dir, exist_ok=True)
+        with open(os.path.join(args.out_dir, "args.json"), "w") as f:
+            json.dump(vars(args), f, indent=4)
     if is_distributed:
         dist.barrier()
-    
 
-
-    train_indices, val_indices, test_indices = load_splits_data(
-        dataset, os.path.join(datapath, "ftrain_idxs.txt"), os.path.join(datapath,"fval_idxs.txt"), os.path.join(datapath, "ftest_idxs.txt")
+    # ── Data ──
+    # with several GPUs every rank would build the same cache at once, so build it first with plain python
+    if is_distributed and not os.path.exists(os.path.join(args.cache_dir, "masked_seqs.npy")):
+        raise SystemExit(f"No mask cache in {args.cache_dir}. Build it first (one process):\n"
+                         f"  python chrombert_pretrain.py --build_cache_only --cache_dir {args.cache_dir}")
+    dataset = ChromBERTDataset(
+        args.data, mask_mode="precomputed_all", num_masks=args.num_masks, cache_dir=args.cache_dir,
+        mask_token=mask_token, random_tokens=range(1, args.n_tokens + 1), cluster_file=args.cluster_file,
     )
-    if dataset.mask_mode == "precomputed_all":
-        num_masks = dataset.num_masks
-        train_indices = [i * num_masks + m for i in train_indices for m in range(num_masks)]
-        val_indices = [i * num_masks + m for i in val_indices for m in range(num_masks)]
-        test_indices = [i * num_masks + m for i in test_indices for m in range(num_masks)]
+    if args.build_cache_only:
+        print(f"Mask cache ready in {args.cache_dir}")
+        return
+    splits = dataset.create_splits_from_data(args.split_file)
+    if args.max_bins:
+        splits = {k: v[:args.max_bins] for k, v in splits.items()}
+    train_idx = mask_indices(splits["train"], args.num_masks)
+    val_idx = mask_indices(splits["val"], args.num_masks)
 
     if is_main_process():
-        print(f"Total Data: {len(dataset)}")
-        print(f"Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
-        print(f"Batch size per GPU: {BATCH_SIZE}, Accumulation steps: {ACCUMULATION_STEPS}")
-        print(f"Effective batch size: {BATCH_SIZE * ACCUMULATION_STEPS * world_size}")
+        print(f"Bins: train {len(splits['train'])}, val {len(splits['val'])}, test {len(splits['test'])}")
+        print(f"Masked sequences: train {len(train_idx)}, val {len(val_idx)}")
+        print(f"Effective batch size: {args.batch_size * args.accum_steps * world_size}")
 
-    train_subset = Subset(dataset, train_indices)
-    val_subset = Subset(dataset, val_indices)
+    train_ds, val_ds = Subset(dataset, train_idx), Subset(dataset, val_idx)
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
+    loader_kw = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True,
+                     persistent_workers=args.num_workers > 0)
+    train_loader = DataLoader(train_ds, sampler=train_sampler, shuffle=train_sampler is None, **loader_kw)
+    val_loader = DataLoader(val_ds, sampler=val_sampler, shuffle=False, **loader_kw)
 
-    if is_distributed:
-        train_sampler = DistributedSampler(
-            train_subset, num_replicas=world_size, rank=rank, shuffle=True
-        )
-        val_sampler = DistributedSampler(
-            val_subset, num_replicas=world_size, rank=rank, shuffle=False
-        )
-        train_loader_shuffle = False
-    else:
-        train_sampler = None
-        val_sampler = None
-        train_loader_shuffle = True
-
-    train_dataloader = DataLoader(
-        train_subset,
-        batch_size=BATCH_SIZE,
-        sampler=train_sampler,
-        shuffle=train_loader_shuffle,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
-    val_dataloader = DataLoader(
-        val_subset,
-        batch_size=BATCH_SIZE,
-        sampler=val_sampler,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
-
-    # --- Model Setup ---
-    model = ChromBERTModel(
-        VOCAB_SIZE, EMBED_DIM, N_HEADS, N_LAYERS, use_gradient_checkpointing=True
-    ).to(device)
-
-    model_path = f"{out_dir}/chrombert_model.pt"
-    if os.path.exists(model_path):
-        # if is_main_process():
-        #     print(f"Loading existing model from {model_path}...")
-        # state_dict = torch.load(model_path, map_location=device)
-        # model = GenomicTransformer(
-        #     VOCAB_SIZE, EMBED_DIM, N_HEADS, N_LAYERS, use_gradient_checkpointing=True
-        # ).to(device)
+    # ── Model ──
+    ckpt_path = os.path.join(args.out_dir, "best_genomic_bert.pt")
+    if args.resume:
         if is_main_process():
-            print(f"Loading existing model from {model_path}...")
-            state_dict = torch.load(model_path, map_location=device)
-
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                new_key = k.replace("_orig_mod.", "")
-                new_state_dict[new_key] = v
-
-            model.load_state_dict(new_state_dict)
-    
-    
+            print(f"Resuming from {ckpt_path}")
+        model = load_chrombert(ckpt_path, vocab_size)
+    else:
+        model = ChromBERTModel(vocab_size, EMBED_DIM, N_HEADS, N_LAYERS, use_gradient_checkpointing=True)
+    model = model.to(device)
     if is_distributed:
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=[device.index])
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = FocalLoss(gamma=2.0, ignore_index=-100)
 
-    total_steps = len(train_dataloader) * EPOCHS
-    warmup_steps = int(0.10 * total_steps)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
+    total_steps = (len(train_loader) // args.accum_steps) * args.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warmup * total_steps),
+                                                num_training_steps=total_steps)
+    if not args.no_compile:
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
-    # --- AMP GradScaler for mixed precision training ---
-    model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+    # ── Train ──
     best_val_loss = float("inf")
-
-    for epoch in range(EPOCHS):
+    history = []
+    for epoch in range(args.epochs):
         if is_distributed:
             train_sampler.set_epoch(epoch)
 
-        # --- TRAINING ---
         model.train()
         total_train_loss = 0.0
         start_time = time.time()
 
-        for bidx, (seq, target) in enumerate(train_dataloader):
-            batch_time_start = time.time()
+        for bidx, (seq, target) in enumerate(train_loader):
             seq = seq.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
-            is_update_step = (
-                (bidx + 1) % ACCUMULATION_STEPS == 0
-                or (bidx + 1) == len(train_dataloader)
-            )
-
-            sync_context = (
-                model.no_sync()
-                if (not is_update_step and hasattr(model, "no_sync"))
-                else nullcontext()
-            )
+            is_update_step = (bidx + 1) % args.accum_steps == 0 or (bidx + 1) == len(train_loader)
+            # skip DDP gradient sync on accumulation steps
+            sync_context = model.no_sync() if (not is_update_step and hasattr(model, "no_sync")) else nullcontext()
 
             with sync_context:
-                # --- Mixed precision forward pass ---
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, output, _, _ = model(seq)  # (B, S, V)
-                    loss = criterion(output.view(-1, VOCAB_SIZE), target.view(-1))
-
-                unscaled_loss = loss.item()
-                loss = loss / ACCUMULATION_STEPS
-
-                # --- Scaled backward pass ---
-                loss.backward()
+                    _, logits = model(seq)  # (B, S, V)
+                    loss = criterion(logits.view(-1, vocab_size), target.view(-1))
+                (loss / args.accum_steps).backward()
 
             if is_update_step:
-                optimizer.step()  # no scaler
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
-            total_train_loss += unscaled_loss
-
+            total_train_loss += loss.item()
             if is_main_process():
-                print(
-                    f"Epoch {epoch+1}/{EPOCHS} | Batch {bidx+1}/{len(train_dataloader)} | Loss {unscaled_loss:.4f}",
-                    end="\r",
-                    flush=True,
-                )
-
+                print(f"Epoch {epoch+1}/{args.epochs} | Batch {bidx+1}/{len(train_loader)} | Loss {loss.item():.4f}",
+                      end="\r", flush=True)
 
         if is_main_process():
-            print(
-                f"\nEpoch {epoch+1} training completed in {(time.time() - start_time)/60:.2f} minutes.",
-                flush=True,
-            )
-            
+            print(f"\nEpoch {epoch+1} training done in {(time.time() - start_time)/60:.2f} min", flush=True)
+        avg_train_loss = total_train_loss / len(train_loader)
 
-        avg_train_loss = total_train_loss / len(train_dataloader)
-
-        # --- VALIDATION ---
+        # ── Validation ──
         model.eval()
         total_val_loss = 0.0
         with torch.no_grad():
-            for seq, target in val_dataloader:
+            for seq, target in val_loader:
                 seq = seq.to(device, non_blocking=True)
                 target = target.to(device, non_blocking=True)
-
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, output, _, _ = model(seq)
-                    loss = criterion(output.view(-1, VOCAB_SIZE), target.view(-1))
-
-                total_val_loss += loss.item()
-
-        avg_val_loss = total_val_loss / max(1, len(val_dataloader))
+                    _, logits = model(seq)
+                    total_val_loss += criterion(logits.view(-1, vocab_size), target.view(-1)).item()
+        avg_val_loss = total_val_loss / max(1, len(val_loader))
 
         if is_distributed:
-            t = torch.tensor(
-                [avg_train_loss, avg_val_loss], device=device, dtype=torch.float32
-            )
+            t = torch.tensor([avg_train_loss, avg_val_loss], device=device)
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            t /= world_size
-            avg_train_loss, avg_val_loss = float(t[0].item()), float(t[1].item())
+            avg_train_loss, avg_val_loss = (t / world_size).tolist()
 
-        # --- LOGGING & SAVING (Rank 0 only) ---
+        # ── Log + save (rank 0) ──
         if is_main_process():
-            print(
-                f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}",
-                flush=True,
-            )
+            print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}", flush=True)
+            history.append({"epoch": epoch + 1, "train_loss": avg_train_loss, "val_loss": avg_val_loss})
+            with open(os.path.join(args.out_dir, "history.json"), "w") as f:
+                json.dump(history, f, indent=2)
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                print(
-                    f"--> Validation improved. Saving best model (Loss: {best_val_loss:.4f})",
-                    flush=True,
-                )
-
-                model_to_save = model.module if is_distributed else model
-                torch.save(
-                    model_to_save.state_dict(), f"{out_dir}/chrombert_model.pt"
-                )
+                torch.save(raw_model(model).state_dict(), ckpt_path)
+                print(f"--> Validation improved. Saved {ckpt_path} (loss {best_val_loss:.4f})", flush=True)
 
         if is_distributed:
             dist.barrier()
 
-    # Cleanup
     if is_distributed:
         cleanup()
 
 
 if __name__ == "__main__":
-    # Compatible with both `torchrun` and `python` launch
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-    if rank == 0:
-        if world_size > 1:
-            print(f"Launching Distributed Training on {world_size} GPUs...")
-        else:
-            print("Launching Single-GPU Training...")
-
-    run_training(rank, world_size)
+    main()
