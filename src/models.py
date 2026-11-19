@@ -65,6 +65,18 @@ class ChromBERTModel(nn.Module):
         return x, logits  # (B, S, V)
 
 
+def load_chrombert(ckpt_path, vocab_size, embed_dim=EMBED_DIM, n_heads=N_HEADS, n_layers=N_LAYERS,
+                   use_gradient_checkpointing=True):
+    """Build ChromBERTModel and load a pretrained checkpoint.
+    Strips the '_orig_mod.' (torch.compile) and 'module.' (DDP) prefixes from saved keys."""
+    model = ChromBERTModel(vocab_size, embed_dim, n_heads, n_layers,
+                           use_gradient_checkpointing=use_gradient_checkpointing)
+    state_dict = torch.load(ckpt_path, map_location="cpu")
+    state_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
+    return model
+
+
 class ChromVAE(nn.Module):
     def __init__(self, vocab_size=5, input_dim=2689, embed_dim=64, latent_dim=128, hidden_dim=256):
         super().__init__()
@@ -152,7 +164,7 @@ class ChromVAE(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # Shared downstream-head building blocks
 #
-# Used by both downstream_model.py (binary classification) and
+# Used by both chrombert_finetune_enhancers.py (binary classification) and
 # train_gene_expression.py (multi-task regression) so the two finetuning
 # scripts share a single model definition instead of drifting copies.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -302,6 +314,8 @@ class MultiWindowHeaderFusion(nn.Module):
         else:
             filter_columns = np.load(filter_by)[0].astype(bool)
             n_factors = int(filter_columns.sum())
+            # load the mask once (not saved in the state_dict, so old checkpoints still load)
+            self.register_buffer("filter_columns", torch.from_numpy(filter_columns), persistent=False)
 
         print(f"Number of factors after filtering: {n_factors}")
         self.res1 = ResidualBlock(n_factors, 1024, dropout=dropout)
@@ -318,8 +332,7 @@ class MultiWindowHeaderFusion(nn.Module):
         if self.filter_by is None:
             x = self.interface(x)  # (B, L, n_factors)
         else:
-            filter_columns = np.load(self.filter_by)[0].astype(bool)
-            x = x[:, filter_columns, :]  # (B, L, n_factors)
+            x = x[:, self.filter_columns, :]  # (B, L, n_factors)
         x = x.permute(0, 2, 1)
         x = self.res1(x)
         x = self.res2(x)

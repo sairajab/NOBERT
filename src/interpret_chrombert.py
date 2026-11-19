@@ -65,7 +65,7 @@ def load_enhancer_labels(labels_file):
     Accepts either a header row (columns include Chromosome, Start, End, Label)
     or the headerless 6-column convention used elsewhere in this project
     (Chromosome, Start, End, Split, FeatureType, Label -- see DATASET_CONFIGS
-    in downstream_model.py).
+    in chrombert_finetune_enhancers.py).
     """
     with open(labels_file) as f:
         second_field = f.readline().split("\t")[1].strip()

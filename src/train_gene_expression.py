@@ -20,7 +20,7 @@ matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 import wandb
 
-from models import ChromBERTModel as ChromBERT, MultiWindowHeaderFusion
+from models import ChromBERTModel as ChromBERT, MultiWindowHeaderFusion, ClassificationHeadOnly
 from distributed_utils import (
     is_distributed,
     is_main_process,
@@ -34,7 +34,7 @@ from distributed_utils import (
 
 """
 Multi-task gene expression regression: ChromBERT backbone -> MultiWindowHeaderFusion
-head (shared with downstream_model.py's binary classification) -> linear output over
+head (shared with chrombert_finetune_enhancers.py's binary classification) -> linear output over
 n_experiments continuous log1p(FPKM) targets, trained with MSELoss.
 
 Convention: y_true, y_pred have shape (n_genes, n_experiments).
@@ -43,7 +43,7 @@ Convention: y_true, y_pred have shape (n_genes, n_experiments).
 """
 
 MAX_SEQ_LEN = 2689
-VOCAB_SIZE = 6  # 0: PAD, 1-4: Labels, 5: MASK
+VOCAB_SIZE = 7  # 0: PAD, 1-4: Labels, 5: MASK
 EMBED_DIM = 768
 N_HEADS = 8
 N_LAYERS = 8
@@ -51,121 +51,6 @@ PAD_TOKEN = 0
 MASK_TOKEN = 5
 NUM_LABELS = 3142
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Dataset
-# ──────────────────────────────────────────────────────────────────────────────
-
-class GeneExpressionDataset(Dataset):
-    def __init__(self, cont_matrix_path, disc_matrix_path, labels_file):
-        super().__init__()
-
-        self.cont_matrix_path = cont_matrix_path
-        self.disc_matrix_path = disc_matrix_path
-        self.labels_file = labels_file
-
-        with h5py.File(self.labels_file, 'r') as f:
-            self.fpkm_vals = f['FPKM_matrix'][:]
-            self.gene_chrom = f['chrom_geneid'][:]
-
-        assert len(self.fpkm_vals) == len(self.gene_chrom), \
-            f"Label/index length mismatch: {len(self.fpkm_vals)} labels vs {len(self.gene_chrom)} gene_chrom entries"
-
-        self.load_input_matrices(cont=False)
-
-    def load_input_matrices(self, cont=False):
-        if cont:
-            self.cont_matrix = pd.read_parquet(self.cont_matrix_path)
-        else:
-            self.cont_matrix = None
-
-        self.disc_matrix = pd.read_csv(self.disc_matrix_path, index_col=0)
-        print("Original disc_matrix columns:", self.disc_matrix.columns.tolist())
-        if 'window.1' in self.disc_matrix.columns:
-            print("Dropping duplicate 'window.1' column from disc_matrix.")
-            self.disc_matrix = self.disc_matrix.drop(columns=['window.1'])
-        self.index = self.disc_matrix.index.tolist()
-
-        self.gene_to_start = defaultdict(int)
-        self.map_index = defaultdict(list)
-
-        for idx in self.index:
-            chrom, other, rest = idx.split(":")
-            strand = int(rest.split("|")[-1])
-            gene, start = other.split("|")
-            if strand == -1:
-                start = rest.split("|")[0]
-            self.gene_to_start[(gene, chrom)] = start
-            self.map_index[(gene, chrom)].append(idx)
-
-        print("Sample gene_to_start keys:", list(self.gene_to_start.items())[:5])
-
-    def load_splits(self, split_path="gene expression/"):
-        train_path = split_path + "Train.txt"
-        val_path   = split_path + "Val.txt"
-        test_path  = split_path + "Test.txt"
-
-        train_ids, val_ids, test_ids = set(), set(), set()
-
-        for path, id_set in [(train_path, train_ids), (val_path, val_ids), (test_path, test_ids)]:
-            with open(path, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    gene, chrom, start = line.split("_")
-                    id_set.add((gene, f"Chr{chrom}", start))
-
-        train_indices, val_indices, test_indices = [], [], []
-        missing = 0
-        print("split size", len(train_ids), len(val_ids), len(test_ids))
-
-        for j in range(len(self.gene_chrom)):
-            arr = self.gene_chrom[j]
-            chrom   = f"Chr{arr[0].decode()}"
-            gene_id = arr[1].decode()
-            start   = self.gene_to_start.get((gene_id, chrom))
-            key     = (gene_id, chrom, start)
-            matched = False
-
-            if key in train_ids:
-                train_indices.append(j); matched = True
-            elif key in val_ids:
-                val_indices.append(j);   matched = True
-            elif key in test_ids:
-                test_indices.append(j);  matched = True
-
-            if not matched:
-                if missing < 10:
-                    print("Sample lookup key:", key)
-                missing += 1
-
-        print("Missing", missing)
-        return {"train": train_indices, "val": val_indices, "test": test_indices}
-
-    def __len__(self):
-        return len(self.gene_chrom)
-
-    def __getitem__(self, idx):
-        sample  = self.gene_chrom[idx]
-        chrom   = f"Chr{sample[0].decode()}"
-        gene_id = sample[1].decode()
-
-        matrix_indices = self.map_index.get((gene_id, chrom), [])
-
-        if len(matrix_indices) == 0:
-            print(f"Warning: Gene {gene_id} on {chrom} not found in map_index.")
-            n_features = self.disc_matrix.shape[1]
-            data = torch.zeros((1, n_features), dtype=torch.long)
-        else:
-            data = torch.tensor(
-                self.disc_matrix.loc[matrix_indices].values,
-                dtype=torch.long
-            )
-
-        # get max
-        data = data.max(dim=0, keepdim=True).values
-        labels = torch.log1p(torch.tensor(self.fpkm_vals[idx], dtype=torch.float32))
-        return data, labels
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +514,7 @@ def _log_summary(summary, prefix):
 # ──────────────────────────────────────────────────────────────
 # Training / evaluation loops
 #
-# Structurally mirrors downstream_model.py's train_one_epoch / evaluate_epoch /
+# Structurally mirrors chrombert_finetune_enhancers.py's train_one_epoch / evaluate_epoch /
 # run_training so the two finetuning scripts are easy to read side by side. The
 # task-specific pieces are: MSELoss instead of CrossEntropyLoss, float (not long)
 # labels, no softmax on the output, and Pearson correlation (not AUPR) as the
@@ -766,8 +651,8 @@ def run_training(model, train_loader, val_loader, test_loader=None, device='cuda
 
     raw_model = get_raw_model(model)
 
-    if is_main_process():
-        wandb.watch(raw_model, log="all", log_freq=200)
+    # if is_main_process():
+    #     wandb.watch(raw_model, log="all", log_freq=200)
 
     # ============================================
     # PHASE 1: Frozen backbone, train head only
@@ -827,11 +712,11 @@ def run_training(model, train_loader, val_loader, test_loader=None, device='cuda
                 torch.save(raw_model.state_dict(), ckpt_path)
                 patience_counter = 0
                 wandb.log({"phase1/best_val_pearson": best_val_pearson})
-                artifact = wandb.Artifact("phase1_checkpoint", type="model",
-                                          description=f"Phase 1 best (epoch {epoch+1})",
-                                          metadata={"epoch": epoch + 1, "val_pearson": val_pearson})
-                artifact.add_file(ckpt_path)
-                wandb.log_artifact(artifact)
+                # artifact = wandb.Artifact("phase1_checkpoint", type="model",
+                #                           description=f"Phase 1 best (epoch {epoch+1})",
+                #                           metadata={"epoch": epoch + 1, "val_pearson": val_pearson})
+                # artifact.add_file(ckpt_path)
+                # wandb.log_artifact(artifact)
             else:
                 patience_counter += 1
 
@@ -932,11 +817,11 @@ def run_training(model, train_loader, val_loader, test_loader=None, device='cuda
                 torch.save(raw_model.state_dict(), ckpt_path)
                 patience_counter = 0
                 wandb.log({"phase2/best_val_pearson": best_val_pearson_phase2})
-                artifact = wandb.Artifact("phase2_checkpoint", type="model",
-                                          description=f"Phase 2 best (epoch {epoch+1})",
-                                          metadata={"epoch": epoch + 1, "val_pearson": val_pearson})
-                artifact.add_file(ckpt_path)
-                wandb.log_artifact(artifact)
+                # artifact = wandb.Artifact("phase2_checkpoint", type="model",
+                #                           description=f"Phase 2 best (epoch {epoch+1})",
+                #                           metadata={"epoch": epoch + 1, "val_pearson": val_pearson})
+                #artifact.add_file(ckpt_path)
+                #wandb.log_artifact(artifact)
             else:
                 patience_counter += 1
 
@@ -985,11 +870,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--cont_data",    default="/s/chromatin/c/nobackup/Saira/BERTModel//DATA/gene expression/gene_Exp_3w_cont.parquet")
-    parser.add_argument("--disc_data",    default="/s/chromatin/c/nobackup/Saira/BERTModel//DATA/gene expression/gene_Exp_500_disc.csv")
+    parser.add_argument("--disc_data",    default="/s/chromatin/c/nobackup/Saira/BERTModel//DATA/gene expression/gene_Exp_500__5emb_disc.csv")
     parser.add_argument("--labels",       default="/s/chromatin/c/nobackup/Saira/BERTModel/gene expression/arabidopsis_expression_data.h5")
     parser.add_argument("--split_path",   default="/s/chromatin/c/nobackup/Saira/BERTModel//gene expression/")
     parser.add_argument("--chrombert_ckpt", required=True, help="Path to pretrained ChromBERT checkpoint")
-    parser.add_argument("--output_dir",   default="/s/chromatin/c/nobackup/Saira/BERTModel/NOBERT/results/results_chrombert_gene_expression_500_log1p_mtx_5")
+    parser.add_argument("--output_dir",   default="/s/chromatin/c/nobackup/Saira/BERTModel/NOBERT/results/results_chrombert_gene_expression_500_log1p_mtx_5emb_new")
     parser.add_argument("--batch_size",   type=int, default=64)
     parser.add_argument("--phase1_epochs", type=int, default=2)
     parser.add_argument("--phase2_epochs", type=int, default=10)
@@ -1082,7 +967,7 @@ if __name__ == "__main__":
 
     # ── Build model ───────────────────────────────────────────────────────────
     model = MultiWindowHeaderFusion(chrombert_model, num_labels=NUM_LABELS, n_windows=1).to(device)
-
+    #model = ClassificationHeadOnly(num_labels=NUM_LABELS).to(device)
     if args.mode == "train":
         model = run_training(
             model, train_loader, val_loader, test_loader, device, local_rank, args.output_dir,
